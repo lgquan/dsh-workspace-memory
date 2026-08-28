@@ -12,6 +12,11 @@ export interface MemoryMessage {
 
 export interface MemoryEntry {
   id: string
+  scope?: 'global' | 'workspace'
+  type?: 'preference' | 'decision' | 'architecture' | 'rule' | 'fact' | 'fix'
+  title?: string
+  description?: string
+  retrievalTerms?: string[]
   content: string
   tags?: string[]
   importance?: number
@@ -22,18 +27,32 @@ export interface MemoryEntry {
 
 export interface MemoryProposal {
   content: string
+  scope?: 'global' | 'workspace'
+  type?: MemoryEntry['type']
+  title?: string
+  description?: string
+  retrievalTerms?: readonly string[]
   tags?: readonly string[]
   importance?: number
 }
 
 interface NormalizedMemoryProposal {
   content: string
+  scope: 'global' | 'workspace'
+  type: NonNullable<MemoryEntry['type']>
+  title: string
+  description: string
+  retrievalTerms: string[]
   tags: string[]
   importance: number
 }
 
 export interface MemoryMatch {
   id: string
+  scope: string
+  title: string
+  description: string
+  type: string
   content: string
   tags: string[]
   importance: number
@@ -52,6 +71,7 @@ export interface RecallInput {
   query: string
   maxBytes?: number
   limit?: number
+  surfacedMemoryIds?: readonly string[]
 }
 
 export type CheckpointReason = 'segment-end' | 'task-end' | 'session-close' | 'compaction' | 'explicit' | 'idle'
@@ -98,6 +118,7 @@ export interface MemoryEngineConfig {
   recallLimit: number
   checkpointMaxChars: number
   keepSummaryVersions: number
+  surfacedPenalty: number
 }
 
 export interface WorkspaceScope {
@@ -216,17 +237,24 @@ function daysSince(iso: string | undefined, now: number): number {
 export function searchEntries(
   entries: readonly MemoryEntry[],
   query: string,
-  options: { limit?: number; now?: number } = {},
+  options: { limit?: number; now?: number; surfacedMemoryIds?: readonly string[]; surfacedPenalty?: number } = {},
 ): Array<{ entry: MemoryEntry; score: number; matchedTokens: number }> {
   const normalizedQuery = normalizeMemoryText(query)
   if (normalizedQuery === '') return []
   const queryTokens = lexicalTokens(normalizedQuery)
   const limit = Math.max(1, Math.min(50, Math.trunc(options.limit ?? 8)))
   const now = options.now ?? Date.now()
+  const surfaced = new Set(options.surfacedMemoryIds ?? [])
   const ranked: Array<{ entry: MemoryEntry; score: number; matchedTokens: number }> = []
   for (const entry of entries) {
     if (entry.status === 'deleted') continue
-    const haystack = normalizeMemoryText(`${entry.content} ${(entry.tags ?? []).join(' ')}`)
+    const haystack = normalizeMemoryText([
+      entry.content,
+      entry.title,
+      entry.description,
+      ...(entry.tags ?? []),
+      ...(entry.retrievalTerms ?? []),
+    ].filter(Boolean).join(' '))
     const haystackTokens = new Set(lexicalTokens(haystack))
     let score = haystack.includes(normalizedQuery) ? 30 : 0
     let matched = 0
@@ -239,8 +267,13 @@ export function searchEntries(
     if (matched === 0) continue
     const coverage = queryTokens.length === 0 ? 0 : matched / queryTokens.length
     score += coverage * 12
+    const titleHit = entry.title !== undefined && normalizeMemoryText(entry.title).includes(normalizedQuery) ? 18 : 0
+    const tagHit = (entry.tags ?? []).some(tag => queryTokens.includes(normalizeMemoryText(tag))) ? 8 : 0
+    const termsHit = (entry.retrievalTerms ?? []).filter(term => haystack.includes(normalizeMemoryText(term))).length * 5
+    score += titleHit + tagHit + termsHit
     score += Math.max(0, Math.min(3, Number(entry.importance ?? 1))) * 1.5
     score += Math.max(0, 3 - Math.log2(1 + daysSince(entry.updatedAt ?? entry.createdAt, now)))
+    if (surfaced.has(entry.id)) score -= options.surfacedPenalty ?? 8
     ranked.push({ entry, score, matchedTokens: matched })
   }
   return ranked
@@ -282,6 +315,20 @@ function validEntry(value: unknown): value is MemoryEntry {
     && typeof value.content === 'string'
 }
 
+function migrateEntry(entry: MemoryEntry, scope: 'global' | 'workspace'): MemoryEntry {
+  return {
+    ...entry,
+    scope: entry.scope ?? scope,
+    type: entry.type ?? 'fact',
+    title: entry.title ?? entry.content.slice(0, 80),
+    description: entry.description ?? entry.content.slice(0, 240),
+    retrievalTerms: entry.retrievalTerms ?? [],
+    tags: entry.tags ?? [],
+    importance: entry.importance ?? 1,
+    status: entry.status ?? 'active',
+  }
+}
+
 function validMessage(value: unknown): value is MemoryMessage {
   return isRecord(value)
     && typeof value.id === 'string'
@@ -293,15 +340,15 @@ function scopeDirectory(root: string, key: string): string {
   return key === 'global' ? join(root, 'global') : join(root, 'scopes', key)
 }
 
-function deterministicSummary(entries: readonly MemoryEntry[], maxBytes: number): string {
+function deterministicSummary(entries: readonly MemoryEntry[], maxBytes: number, heading = '# Workspace memory'): string {
   const active = entries
     .filter(entry => entry.status !== 'deleted')
     .sort((left, right) => Number(right.importance ?? 1) - Number(left.importance ?? 1)
       || String(right.updatedAt).localeCompare(String(left.updatedAt)))
-  const lines = ['# Workspace memory', '', 'Durable reference facts maintained by dsh-workspace-memory.', '']
+  const lines = [heading, '', 'Durable reference facts maintained by dsh-workspace-memory.', '']
   for (const entry of active) {
     const tags = (entry.tags ?? []).length > 0 ? ` [${entry.tags?.join(', ')}]` : ''
-    const candidate = `- ${entry.content}${tags}`
+    const candidate = `- ${entry.title ?? entry.content}: ${entry.description ?? entry.content}${tags}`
     if (Buffer.byteLength([...lines, candidate, ''].join('\n')) > maxBytes) break
     lines.push(candidate)
   }
@@ -389,7 +436,7 @@ export class WorkspaceMemoryStore {
   async readEntries(scope: WorkspaceScope): Promise<MemoryEntry[]> {
     const raw = await readFile(join(scope.dir, ENTRIES_FILE), 'utf8').catch(() => '[]')
     try {
-      return safeArray(JSON.parse(raw) as unknown).filter(validEntry)
+      return safeArray(JSON.parse(raw) as unknown).filter(validEntry).map(entry => migrateEntry(entry, scope.key === 'global' ? 'global' : 'workspace'))
     } catch {
       return []
     }
@@ -432,7 +479,7 @@ export class WorkspaceMemoryStore {
       const history = join(scope.dir, HISTORY_DIR, `${String(this.now())}-${this.uuid()}.md`)
       await this.writeAtomic(history, previous)
     }
-    await this.writeAtomic(file, deterministicSummary(entries, maxBytes))
+    await this.writeAtomic(file, deterministicSummary(entries, maxBytes, scope.key === 'global' ? '# Global memory' : '# Workspace memory'))
     const historyFiles = (await readdir(join(scope.dir, HISTORY_DIR)).catch(() => [])).sort().reverse()
     for (const stale of historyFiles.slice(Math.max(0, keepHistory))) {
       await unlink(join(scope.dir, HISTORY_DIR, stale)).catch(() => {})
@@ -468,7 +515,27 @@ function normalizeProposal(value: unknown): NormalizedMemoryProposal | undefined
     .map(tag => tag.trim().toLowerCase())
     .filter(Boolean))].slice(0, 8)
   const importance = Math.max(0, Math.min(3, Math.trunc(Number(value.importance ?? 1))))
-  return { content, tags, importance: Number.isFinite(importance) ? importance : 1 }
+  const allowedTypes = new Set<MemoryEntry['type']>(['preference', 'decision', 'architecture', 'rule', 'fact', 'fix'])
+  const candidateType = value.type
+  const type: NonNullable<MemoryEntry['type']> = typeof candidateType === 'string' && allowedTypes.has(candidateType as NonNullable<MemoryEntry['type']>)
+    ? candidateType as NonNullable<MemoryEntry['type']>
+    : 'fact'
+  const title = typeof value.title === 'string' && value.title.trim() !== '' ? value.title.trim().slice(0, 160) : content.slice(0, 80)
+  const description = typeof value.description === 'string' && value.description.trim() !== '' ? value.description.trim().slice(0, 500) : content.slice(0, 240)
+  const retrievalTerms = [...new Set(safeArray(value.retrievalTerms)
+    .filter((term): term is string => typeof term === 'string')
+    .map(term => term.trim())
+    .filter(Boolean))].slice(0, 16)
+  return {
+    content,
+    scope: value.scope === 'global' ? 'global' : 'workspace',
+    type,
+    title,
+    description,
+    retrievalTerms,
+    tags,
+    importance: Number.isFinite(importance) ? importance : 1,
+  }
 }
 
 function applyProposals(
@@ -492,6 +559,10 @@ function applyProposals(
       .sort((left, right) => right.similarity - left.similarity)[0]
     if (duplicate !== undefined && duplicate.similarity >= 0.68) {
       duplicate.entry.content = normalized.content.length >= duplicate.entry.content.length ? normalized.content : duplicate.entry.content
+      duplicate.entry.title = normalized.title
+      duplicate.entry.description = normalized.description
+      duplicate.entry.type = normalized.type
+      duplicate.entry.retrievalTerms = [...new Set([...(duplicate.entry.retrievalTerms ?? []), ...normalized.retrievalTerms])]
       duplicate.entry.tags = [...new Set([...(duplicate.entry.tags ?? []), ...normalized.tags])]
       duplicate.entry.importance = Math.max(Number(duplicate.entry.importance ?? 1), normalized.importance)
       duplicate.entry.updatedAt = nowIso
@@ -500,6 +571,11 @@ function applyProposals(
     }
     entries.push({
       id: `mem-${uuid().replaceAll('-', '').slice(0, 12)}`,
+      scope: normalized.scope,
+      type: normalized.type,
+      title: normalized.title,
+      description: normalized.description,
+      retrievalTerms: normalized.retrievalTerms,
       content: normalized.content,
       tags: normalized.tags,
       importance: normalized.importance,
@@ -531,6 +607,7 @@ export class WorkspaceMemoryEngine {
       recallLimit: options.config?.recallLimit ?? 8,
       checkpointMaxChars: options.config?.checkpointMaxChars ?? 40_000,
       keepSummaryVersions: options.config?.keepSummaryVersions ?? 10,
+      surfacedPenalty: options.config?.surfacedPenalty ?? 8,
     }
   }
 
@@ -538,9 +615,28 @@ export class WorkspaceMemoryEngine {
     const scope = this.store.scope(input.cwd)
     return this.store.withScope(scope, async () => {
       await this.store.ensure(scope)
-      const [summary, entries] = await Promise.all([this.store.readSummary(scope), this.store.readEntries(scope)])
-      const matches = searchEntries(entries, input.query, { limit: input.limit ?? this.config.recallLimit })
-        .map(({ entry, score }) => ({ id: entry.id, content: redactSecrets(entry.content), tags: entry.tags ?? [], importance: entry.importance ?? 1, score }))
+      const global = this.store.scope('')
+      await this.store.ensure(global)
+      const [workspaceSummary, globalSummary, workspaceEntries, globalEntries] = await Promise.all([
+        this.store.readSummary(scope), this.store.readSummary(global), this.store.readEntries(scope), this.store.readEntries(global),
+      ])
+      const entries = scope.key === 'global' ? globalEntries : [...globalEntries, ...workspaceEntries]
+      const summary = scope.key === 'global' ? globalSummary : [globalSummary, workspaceSummary].filter(value => value.trim() !== '').join('\n\n')
+      const matches = searchEntries(entries, input.query, {
+        limit: input.limit ?? this.config.recallLimit,
+        ...(input.surfacedMemoryIds === undefined ? {} : { surfacedMemoryIds: input.surfacedMemoryIds }),
+        surfacedPenalty: this.config.surfacedPenalty,
+      }).map(({ entry, score }) => ({
+        id: entry.id,
+        scope: entry.scope ?? 'workspace',
+        title: entry.title ?? entry.content.slice(0, 80),
+        description: entry.description ?? entry.content.slice(0, 240),
+        type: entry.type ?? 'fact',
+        content: redactSecrets(entry.content),
+        tags: entry.tags ?? [],
+        importance: entry.importance ?? 1,
+        score,
+      }))
       const budget = input.maxBytes ?? this.config.recallMaxBytes
       let remaining = Math.max(0, budget - Buffer.byteLength(summary))
       const boundedMatches: MemoryMatch[] = []
@@ -610,25 +706,46 @@ export class WorkspaceMemoryEngine {
       }
       const entries = await this.store.readEntries(scope)
       const nowIso = new Date(this.store.now()).toISOString()
-      const result = applyProposals(entries, proposals, nowIso, this.store.uuid)
+      const workspaceProposals = proposals.filter(proposal => normalizeProposal(proposal)?.scope !== 'global')
+      const globalProposals = proposals.filter(proposal => normalizeProposal(proposal)?.scope === 'global')
+      const result = applyProposals(entries, workspaceProposals, nowIso, this.store.uuid)
       state.seenMessageIds = [...state.seenMessageIds, ...staged.map(message => message.id)].slice(-1024)
       const stagedIds = new Set(staged.map(message => message.id))
       state.pendingMessages = state.pendingMessages.filter(message => !stagedIds.has(message.id))
       state.lastCheckpointAt = this.store.now()
       state.checkpointCount += 1
       await this.store.writeEntries(scope, entries)
+      let globalResult: MutationResult = { added: 0, updated: 0, ignored: 0 }
+      if (globalProposals.length > 0 && scope.key !== 'global') {
+        const globalScope = this.store.scope('')
+        await this.store.ensure(globalScope)
+        const globalEntries = await this.store.readEntries(globalScope)
+        globalResult = applyProposals(globalEntries, globalProposals, nowIso, this.store.uuid)
+        await this.store.writeEntries(globalScope, globalEntries)
+        if (globalResult.added + globalResult.updated > 0 || !(await this.store.readSummary(globalScope)).trim()) {
+          await this.store.rebuildSummary(globalScope, globalEntries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
+        }
+      }
       if (state.checkpointCount % this.config.consolidateEvery === 0 || !(await this.store.readSummary(scope)).trim()) {
         state.version += 1
         await this.store.rebuildSummary(scope, entries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
       }
       await this.store.writeCheckpoint(scope, input.reason, staged, proposals, result)
       await this.store.writeState(scope, state)
-      return { status: 'committed', scope: scope.key, accepted, pending: state.pendingMessages.length, ...result }
+      return {
+        status: 'committed',
+        scope: scope.key,
+        accepted,
+        pending: state.pendingMessages.length,
+        added: result.added + globalResult.added,
+        updated: result.updated + globalResult.updated,
+        ignored: result.ignored + globalResult.ignored,
+      }
     })
   }
 
   async remember(input: RememberInput): Promise<{ scope: string } & MutationResult> {
-    const scope = this.store.scope(input.cwd)
+    const scope = input.scope === 'global' ? this.store.scope('') : this.store.scope(input.cwd)
     return this.store.withScope(scope, async () => {
       await this.store.ensure(scope)
       const entries = await this.store.readEntries(scope)

@@ -60,6 +60,7 @@ Git 项目目录，除非显式配置 `memoryDir`。
         recallLimit: 8
         checkpointMaxChars: 40000
         keepSummaryVersions: 10
+        surfacedPenalty: 8
         summarizeProvider: ''
         summarizeModel: ''
 ```
@@ -80,6 +81,9 @@ workspace-memory/
         ├── checkpoints/
         └── summary_history/
 ```
+
+项目 Session 会同时读取 `global/` 与对应 `scopes/ws-<hash>/` 的摘要和长期记忆；
+全局记忆适合用户偏好和通用工作方式，Workspace 记忆适合项目架构、决策和修复。
 
 `memory_entries.json` 是事实来源；`memory_summary.md` 是自动注入的短摘要；
 `checkpoints/` 保留每次阶段性蒸馏的可审计 Markdown 记录。

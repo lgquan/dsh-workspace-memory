@@ -52,6 +52,7 @@ export interface Config {
   keepSummaryVersions?: number
   summarizeProvider?: string
   summarizeModel?: string
+  surfacedPenalty?: number
 }
 
 interface ResolvedConfig {
@@ -67,6 +68,7 @@ interface ResolvedConfig {
   keepSummaryVersions: number
   summarizeProvider: string
   summarizeModel: string
+  surfacedPenalty: number
 }
 
 export const Config = z.object({
@@ -82,6 +84,7 @@ export const Config = z.object({
   keepSummaryVersions: z.natural().default(DEFAULTS.keepSummaryVersions),
   summarizeProvider: z.string().default(''),
   summarizeModel: z.string().default(''),
+  surfacedPenalty: z.number().min(0).default(8),
 })
 
 function dshHome(): string {
@@ -102,6 +105,7 @@ function configWithDefaults(config: Config): ResolvedConfig {
     keepSummaryVersions: config.keepSummaryVersions ?? DEFAULTS.keepSummaryVersions,
     summarizeProvider: config.summarizeProvider ?? '',
     summarizeModel: config.summarizeModel ?? '',
+    surfacedPenalty: config.surfacedPenalty ?? 8,
     memoryDir: typeof config.memoryDir === 'string' && config.memoryDir.trim() !== ''
       ? config.memoryDir.trim()
       : join(dshHome(), 'workspace-memory'),
@@ -151,7 +155,7 @@ function memoryReference(context: Pick<MemoryContext, 'summary' | 'matches'>, in
   const sections: string[] = []
   if (includeSummary && context.summary.trim() !== '') sections.push(`稳定摘要：\n${context.summary.trim()}`)
   if (context.matches.length > 0) {
-    sections.push('与当前问题相关的长期记忆：\n' + context.matches.map(item => `- [${item.id}] ${item.content}`).join('\n'))
+    sections.push('与当前问题相关的长期记忆：\n' + context.matches.map(item => `- [${item.id}] [${item.type ?? 'fact'}] ${item.title}\n  ${item.description}\n  ${item.content}`).join('\n'))
   }
   if (sections.length === 0) return ''
   return [
@@ -164,6 +168,10 @@ function memoryReference(context: Pick<MemoryContext, 'summary' | 'matches'>, in
 
 function outputText(value: string): ContentBlock[] {
   return [{ type: 'text', text: value }]
+}
+
+function readSummaryFile(file: string): string {
+  try { return readFileSync(file, 'utf8') } catch { return '' }
 }
 
 function sessionFromScope(scope: unknown): { header: { cwd?: string } } | undefined {
@@ -186,6 +194,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
   private readonly idleTimers = new Map<string, NodeJS.Timeout>()
   private readonly store: WorkspaceMemoryStore
   private readonly engine: WorkspaceMemoryEngine
+  private readonly surfacedBySession = new Map<string, Set<string>>()
 
   constructor(ctx: Context, config: Config = {}) {
     super(ctx, 'workspaceMemory')
@@ -204,6 +213,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
     ctx.effect(() => () => {
       for (const timer of this.idleTimers.values()) clearTimeout(timer)
       this.idleTimers.clear()
+      this.surfacedBySession.clear()
     }, 'workspace-memory idle checkpoints')
     ctx.logger.info('workspace-memory ready (dir=%s)', this.settings.memoryDir)
   }
@@ -211,7 +221,19 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
   async recall(input: RecallInput): Promise<MemoryContext> {
     const cwd = await this.resolveCwd(input)
     try {
-      return await this.engine.recall({ ...input, cwd })
+      const surfaced = input.sessionId === undefined ? undefined : [...(this.surfacedBySession.get(String(input.sessionId)) ?? [])]
+      const result = await this.engine.recall({ ...input, cwd, ...(surfaced === undefined ? {} : { surfacedMemoryIds: surfaced }) })
+      if (input.sessionId !== undefined) {
+        const ids = this.surfacedBySession.get(String(input.sessionId)) ?? new Set<string>()
+        for (const match of result.matches) ids.add(match.id)
+        while (ids.size > 32) {
+          const oldest = ids.values().next().value
+          if (typeof oldest !== 'string') break
+          ids.delete(oldest)
+        }
+        this.surfacedBySession.set(String(input.sessionId), ids)
+      }
+      return result
     } catch (error) {
       this.ctx.logger.warn('workspace-memory recall failed: %o', error)
       return { scope: this.store.scope(cwd).key, summary: '', matches: [] }
@@ -276,7 +298,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
           '',
           '从下面的对话中提取值得跨 Session 保存的原子事实。只保留：用户明确偏好、项目事实、最终决策及原因、约定、错误修复、明确要求记住的内容。',
           '忽略寒暄、临时任务、进度播报、未确认猜测、密钥和凭据。每条只表达一个事实。',
-          '只输出一行 JSON：{"memories":[{"content":"...","tags":["project"],"importance":0}]}。importance 取 0 到 3。没有内容时输出 {"memories":[]}。',
+          '只输出一行 JSON：{"memories":[{"scope":"workspace","type":"fact","title":"...","description":"...","content":"...","tags":["project"],"retrievalTerms":["同义词"],"importance":0}]}。scope 只能是 global 或 workspace；全局只保存用户长期偏好和通用工作方式，项目事实保存到 workspace。type 只能是 preference/decision/architecture/rule/fact/fix。没有内容时输出 {"memories":[]}。',
           '',
           '<conversation>',
           excerpt,
@@ -313,7 +335,10 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
           try {
             const session = context.agent?.session ?? sessionFromScope(context.scope)
             const scope = this.store.scope(session?.header?.cwd ?? '')
-            const summary = readFileSync(join(scope.dir, SUMMARY_FILE), 'utf8')
+            const global = this.store.scope('')
+            const workspaceSummary = readSummaryFile(join(scope.dir, SUMMARY_FILE))
+            const globalSummary = scope.key === 'global' ? '' : readSummaryFile(join(global.dir, SUMMARY_FILE))
+            const summary = [globalSummary, workspaceSummary].filter(value => value.trim() !== '').join('\n\n')
             return memoryReference({ summary: redactSecrets(truncateUtf8(summary, this.settings.summaryMaxBytes)), matches: [] })
           } catch {
             return ''
@@ -378,6 +403,10 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
                 type: 'array', required: true, items: {
                   type: 'object', additionalProperties: false, properties: {
                     id: { type: 'string', required: true },
+                    scope: { type: 'string', required: true },
+                    title: { type: 'string', required: true },
+                    description: { type: 'string', required: true },
+                    type: { type: 'string', required: true },
                     content: { type: 'string', required: true },
                     tags: { type: 'array', required: true, items: { type: 'string' } },
                     importance: { type: 'number', required: true },

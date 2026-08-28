@@ -184,3 +184,28 @@ test('keeps only the configured number of previous summaries', async () => {
   const history = await readdir(join(scope.dir, 'summary_history'))
   assert.equal(history.length, 1)
 })
+
+test('merges global and workspace memories while preserving field-aware ranking', async () => {
+  const f = await fixture()
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace')
+  await f.engine.remember({ scope: 'global', cwd, content: '用户偏好使用中文回答。', title: '语言偏好', description: '默认使用中文', tags: ['preference'], importance: 2 })
+  await f.engine.remember({ cwd, content: '项目使用 TypeScript。', title: '项目语言', description: '代码统一使用 TypeScript', tags: ['typescript'], type: 'architecture', retrievalTerms: ['TS'] })
+  const context = await f.engine.recall({ cwd, query: 'TS 项目语言' })
+  assert.equal(context.matches[0]?.title, '项目语言')
+  assert.ok(context.matches.some(match => match.title === '语言偏好'))
+  assert.match(context.summary, /Global memory/u)
+  assert.match(context.summary, /Workspace memory/u)
+})
+
+test('supports legacy entries without metadata', async () => {
+  const f = await fixture()
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace')
+  const scope = f.store.scope(cwd)
+  await f.store.ensure(scope)
+  await f.store.writeEntries(scope, [{ id: 'legacy', content: '旧版记忆内容。' }])
+  const entries = await f.store.readEntries(scope)
+  assert.equal(entries[0]?.type, 'fact')
+  assert.equal(entries[0]?.title, '旧版记忆内容。')
+})

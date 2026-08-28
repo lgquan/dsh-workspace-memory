@@ -23,6 +23,8 @@ interface WorkspaceMemory {
   persists them. Callers do not implement checkpoint policy.
 - Both operations resolve scope from `sessionId` or an explicit `cwd`.
 - Missing/empty `cwd` resolves to the global scope.
+- A project scope recalls both global and workspace entries; writes may be classified
+  as `global` or `workspace` by the distiller.
 - Failure to recall memory never prevents an Agent or voice response.
 
 The production adapter is the Cordis `workspaceMemory` service. Tests use an
@@ -60,9 +62,10 @@ Version 1 deliberately has no BM25, vector database, or embedding dependency.
 It performs structured lexical retrieval over parsed entries:
 
 1. exact phrase and normalized substring matches;
-2. ASCII word and CJK character-bigram coverage;
-3. tag matches;
-4. importance and recency tie-breaking.
+2. title, retrieval-term, and tag matches;
+3. ASCII word and CJK character-bigram coverage;
+4. description/content matches;
+5. importance, recency, and a short-lived surfaced-memory penalty.
 
 The result is bounded by entry count and UTF-8 bytes. Memory is always treated
 as reference data and never as an instruction overriding the current user.
@@ -97,6 +100,8 @@ rebuilt from active entries. A bounded history is kept before replacement.
 - `agent/turn-stopping` submits that turn to `checkpoint` without blocking turn
   completion.
 - memory tools provide explicit search, remember, and forget operations.
+- `memory_search` remains the Agentic second-search seam: an Agent can issue
+  alternate queries when the automatic first recall is insufficient.
 
 ## Voco integration
 
