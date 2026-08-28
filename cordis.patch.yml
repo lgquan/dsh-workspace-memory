@@ -1,0 +1,10 @@
+# Workspace memory is independent from Voco. Installing both enables their
+# optional Cordis service integration; either plugin can run alone.
+- insert:
+    - id: workspace-memory
+      name: '@flowingspring/dsh-workspace-memory'
+      config:
+        checkpointTurns: 10
+        checkpointChars: 4000
+        idleCheckpointMs: 300000
+        consolidateEvery: 5
