@@ -97,8 +97,9 @@ rebuilt from active entries. A bounded history is kept before replacement.
 - `systemPrompt.context` injects the stable summary on every Agent step.
 - `agent/pre-step` calls `recall` for the current user message and appends only
   relevant entries on step 1.
-- `agent/turn-stopping` submits that turn to `checkpoint` without blocking turn
-  completion.
+- `agent/turn-stopping` submits the completed turn to the checkpoint buffer
+  without forcing an LLM distillation; threshold, idle, task-end, and close
+  policy decides when a stage is ready.
 - memory tools provide explicit search, remember, and forget operations.
 - `memory_search` remains the Agentic second-search seam: an Agent can issue
   alternate queries when the automatic first recall is insufficient.

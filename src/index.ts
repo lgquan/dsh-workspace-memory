@@ -375,7 +375,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
     ctx.on('agent/turn-stopping', ({ agent }) => {
       if (agent.session.header.parentSession !== undefined || agent.session.header.origin === 'subagent') return
       const messages = conversationMessages(agent)
-      void this.checkpoint({ sessionId: agent.session.id, messages, reason: 'task-end', force: true }).catch(error => {
+      void this.checkpoint({ sessionId: agent.session.id, messages, reason: 'segment-end' }).catch(error => {
         ctx.logger.warn('workspace-memory Agent checkpoint failed: %o', error)
       })
     })

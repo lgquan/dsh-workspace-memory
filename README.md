@@ -14,6 +14,7 @@ Session 共享一份稳定摘要和长期原子记忆，并通过可选 Cordis �
   bigram、标签、重要性和新近度综合排序。
 - 任务结束、10 轮对话、4000 字符、空闲 5 分钟或 Session 关闭时评估
   checkpoint；不会按固定小时机械写入。
+- Agent turn 结束只进入 checkpoint 缓冲，不会每轮强制调用记忆蒸馏模型。
 - LLM 只蒸馏长期有效事实；重复/近重复事实会更新原条目。
 - 提供 `memory_search`、`memory_remember`、`memory_forget` 工具。
 - 凭据形态内容默认拒绝持久化，并在模型输入前脱敏。

@@ -269,7 +269,13 @@ export function searchEntries(
     score += coverage * 12
     const titleHit = entry.title !== undefined && normalizeMemoryText(entry.title).includes(normalizedQuery) ? 18 : 0
     const tagHit = (entry.tags ?? []).some(tag => queryTokens.includes(normalizeMemoryText(tag))) ? 8 : 0
-    const termsHit = (entry.retrievalTerms ?? []).filter(term => haystack.includes(normalizeMemoryText(term))).length * 5
+    const termsHit = (entry.retrievalTerms ?? []).filter(term => {
+      const normalizedTerm = normalizeMemoryText(term)
+      if (normalizedTerm === '') return false
+      if (normalizedQuery.includes(normalizedTerm)) return true
+      const termTokens = lexicalTokens(normalizedTerm)
+      return termTokens.some(token => queryTokens.includes(token))
+    }).length * 5
     score += titleHit + tagHit + termsHit
     score += Math.max(0, Math.min(3, Number(entry.importance ?? 1))) * 1.5
     score += Math.max(0, 3 - Math.log2(1 + daysSince(entry.updatedAt ?? entry.createdAt, now)))
@@ -638,17 +644,18 @@ export class WorkspaceMemoryEngine {
         score,
       }))
       const budget = input.maxBytes ?? this.config.recallMaxBytes
-      let remaining = Math.max(0, budget - Buffer.byteLength(summary))
+      const boundedSummary = redactSecrets(truncateUtf8(summary, Math.min(budget, this.config.summaryMaxBytes)))
+      let remaining = Math.max(0, budget - Buffer.byteLength(boundedSummary))
       const boundedMatches: MemoryMatch[] = []
       for (const match of matches) {
-        const bytes = Buffer.byteLength(match.content)
+        const bytes = Buffer.byteLength(JSON.stringify(match))
         if (bytes > remaining) continue
         boundedMatches.push(match)
         remaining -= bytes
       }
       return {
         scope: scope.key,
-        summary: redactSecrets(truncateUtf8(summary, Math.min(budget, this.config.summaryMaxBytes))),
+        summary: boundedSummary,
         matches: boundedMatches,
       }
     })
@@ -718,13 +725,16 @@ export class WorkspaceMemoryEngine {
       let globalResult: MutationResult = { added: 0, updated: 0, ignored: 0 }
       if (globalProposals.length > 0 && scope.key !== 'global') {
         const globalScope = this.store.scope('')
-        await this.store.ensure(globalScope)
-        const globalEntries = await this.store.readEntries(globalScope)
-        globalResult = applyProposals(globalEntries, globalProposals, nowIso, this.store.uuid)
-        await this.store.writeEntries(globalScope, globalEntries)
-        if (globalResult.added + globalResult.updated > 0 || !(await this.store.readSummary(globalScope)).trim()) {
-          await this.store.rebuildSummary(globalScope, globalEntries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
-        }
+        globalResult = await this.store.withScope(globalScope, async () => {
+          await this.store.ensure(globalScope)
+          const globalEntries = await this.store.readEntries(globalScope)
+          const result = applyProposals(globalEntries, globalProposals, nowIso, this.store.uuid)
+          await this.store.writeEntries(globalScope, globalEntries)
+          if (result.added + result.updated > 0 || !(await this.store.readSummary(globalScope)).trim()) {
+            await this.store.rebuildSummary(globalScope, globalEntries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
+          }
+          return result
+        })
       }
       if (state.checkpointCount % this.config.consolidateEvery === 0 || !(await this.store.readSummary(scope)).trim()) {
         state.version += 1

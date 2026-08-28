@@ -81,6 +81,15 @@ test('ranks exact and CJK-related entries', () => {
   assert.equal(searchEntries(entries, 'PostgreSQL database', { now: Date.parse('2026-08-29T00:00:00Z') })[0]?.entry.id, 'b')
 })
 
+test('only rewards retrieval terms that overlap the query', () => {
+  const entries = [
+    { id: 'with-terms', content: '数据库使用 PostgreSQL。', retrievalTerms: ['washout', '治疗间隔'], importance: 1 },
+    { id: 'without-terms', content: '数据库使用 PostgreSQL。', importance: 1 },
+  ]
+  const results = searchEntries(entries, '数据库')
+  assert.equal(results[0]?.score, results[1]?.score)
+})
+
 test('buffers until a logical stage and deduplicates message ids', async () => {
   const f = await fixture()
   onTestFinished(f.cleanup)
@@ -208,4 +217,18 @@ test('supports legacy entries without metadata', async () => {
   const entries = await f.store.readEntries(scope)
   assert.equal(entries[0]?.type, 'fact')
   assert.equal(entries[0]?.title, '旧版记忆内容。')
+})
+
+test('budgets matches after truncating the combined summaries', async () => {
+  const f = await fixture({ config: { summaryMaxBytes: 1000 } })
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace')
+  for (let index = 0; index < 16; index += 1) {
+    await f.engine.remember({ scope: 'global', content: `全局长期偏好 ${index}：${'偏好内容'.repeat(30)}`, importance: 1 })
+    await f.engine.remember({ cwd, content: `项目长期事实 ${index}：${'项目内容'.repeat(30)}`, importance: 1 })
+  }
+  await f.engine.remember({ cwd, content: '预算测试目标记忆：项目使用 TypeScript。', title: '预算测试目标', importance: 3 })
+  const context = await f.engine.recall({ cwd, query: '预算测试目标 TypeScript', maxBytes: 1500 })
+  assert.equal(context.summary.length > 0, true)
+  assert.equal(context.matches[0]?.title, '预算测试目标')
 })
