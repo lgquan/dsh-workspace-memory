@@ -1,7 +1,6 @@
-import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { createElement as h } from 'react'
 import type { SettingsSectionOwnerProps } from '@deepseek-ai/dsh-client-ui-settings/client'
-import type { SessionListState } from '@deepseek-ai/dsh-client-runtime/client'
 
 const NS = 'workspace-memory'
 
@@ -11,7 +10,7 @@ const zh = {
   refresh: '刷新',
   global: '全局记忆',
   workspace: '项目记忆',
-  current: '当前项目',
+  scope: '选择记忆范围',
   emptyScopes: '还没有已记录的项目记忆',
   summary: '摘要记忆',
   entries: '结构化记忆',
@@ -35,7 +34,7 @@ const en = {
   refresh: 'Refresh',
   global: 'Global memory',
   workspace: 'Project memory',
-  current: 'Current project',
+  scope: 'Memory scope',
   emptyScopes: 'No project memories recorded yet',
   summary: 'Summary memory',
   entries: 'Structured memory',
@@ -86,15 +85,6 @@ interface ScopePayload {
   state: { pending: number; checkpointCount: number; lastCheckpointAt: number }
 }
 
-interface Snapshot<T> {
-  getSnapshot(): T
-  subscribe(listener: () => void): () => void
-}
-
-interface SessionsLike {
-  list: Snapshot<SessionListState>
-}
-
 interface SlotsLike {
   inject(slot: string, register: () => unknown): void
   register(options: Record<string, unknown>, component: () => unknown): unknown
@@ -109,21 +99,12 @@ interface MemoryClientContext {
   effect(callback: () => unknown, label?: string): void
   slots: SlotsLike
   locale: LocaleLike
-  sessions: SessionsLike
-}
-
-function useSnapshot<T>(source: Snapshot<T>): T {
-  return useSyncExternalStore(source.subscribe, source.getSnapshot, source.getSnapshot)
 }
 
 function workspaceName(cwd: string, fallback: string): string {
   const normalized = cwd.replaceAll('\\', '/').replace(/\/+$/u, '')
   const name = normalized.split('/').filter(Boolean).at(-1)
   return name ?? fallback
-}
-
-function normalizeCwd(cwd: string): string {
-  return cwd.replaceAll('\\', '/').replace(/\/+$/u, '').toLocaleLowerCase()
 }
 
 function formatDate(value: string | undefined): string {
@@ -139,9 +120,7 @@ function iconRefresh(): ReturnType<typeof h> {
   )
 }
 
-function MemorySection({ t, sessions }: { t: Translate; sessions: SessionsLike } & Partial<SettingsSectionOwnerProps>) {
-  const sessionList = useSnapshot(sessions.list)
-  const currentCwd = sessionList.current === undefined ? '' : sessionList.byId[sessionList.current]?.cwd ?? ''
+function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerProps>) {
   const [scopes, setScopes] = useState<ScopeInfo[]>([])
   const [selectedKey, setSelectedKey] = useState('global')
   const [payload, setPayload] = useState<ScopePayload | undefined>()
@@ -168,7 +147,7 @@ function MemorySection({ t, sessions }: { t: Translate; sessions: SessionsLike }
     try {
       const nextScopes = await loadScopes()
       setScopes(nextScopes)
-      const next = await loadScope(cwd ?? payload?.scope.cwd ?? currentCwd)
+      const next = await loadScope(cwd ?? payload?.scope.cwd ?? '')
       setPayload(next)
       setSelectedKey(next.scope.key)
     } catch {
@@ -179,38 +158,15 @@ function MemorySection({ t, sessions }: { t: Translate; sessions: SessionsLike }
   }
 
   useEffect(() => {
-    void reload(currentCwd)
-    // The initial project follows the current session; later changes are user-selected.
+    void reload()
+    // Memory browsing is independent from the currently open session.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const options = useMemo(() => {
     const known = new Map(scopes.map(scope => [scope.key, scope]))
-    if (payload !== undefined && !known.has(payload.scope.key)) {
-      known.set(payload.scope.key, {
-        key: payload.scope.key,
-        cwd: payload.scope.cwd,
-        kind: payload.scope.kind,
-        entryCount: payload.entries.length,
-        hasSummary: payload.summary.trim() !== '',
-        pending: payload.state.pending,
-        checkpointCount: payload.state.checkpointCount,
-      })
-    }
-    const currentKey = `current:${currentCwd.toLocaleLowerCase()}`
-    if (currentCwd !== '' && !known.has(currentKey) && ![...known.values()].some(scope => normalizeCwd(scope.cwd) === normalizeCwd(currentCwd))) {
-      known.set(currentKey, {
-        key: currentKey,
-        cwd: currentCwd,
-        kind: 'workspace',
-        entryCount: 0,
-        hasSummary: false,
-        pending: 0,
-        checkpointCount: 0,
-      })
-    }
     return [...known.values()]
-  }, [scopes, currentCwd, payload])
+  }, [scopes])
 
   const filteredEntries = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase()
@@ -246,7 +202,7 @@ function MemorySection({ t, sessions }: { t: Translate; sessions: SessionsLike }
       }, iconRefresh()),
     ),
     h('div', { style: { display: 'grid', gap: 8, marginBottom: 18 } },
-      h('label', { style: { color: colors.secondary, fontSize: 12 } }, t('current')),
+      h('label', { style: { color: colors.secondary, fontSize: 12 } }, t('scope')),
       h('select', {
         value: selectedKey, onChange: (event: Event) => { onSelect((event.target as unknown as { value: string }).value) },
         style: { minHeight: 38, padding: '0 10px', color: colors.text, background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 6 },
@@ -290,7 +246,7 @@ function MemorySection({ t, sessions }: { t: Translate; sessions: SessionsLike }
   )
 }
 
-export const inject = ['slots', 'locale', 'sessions']
+export const inject = ['slots', 'locale']
 
 export function apply(ctx: MemoryClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'workspace-memory: dictionaries')
@@ -305,5 +261,5 @@ export function apply(ctx: MemoryClientContext): void {
     order: 50,
     label: () => t('nav'),
     locale: NS,
-  }, () => h(MemorySection, { t, sessions: ctx.sessions })))
+  }, () => h(MemorySection, { t })))
 }

@@ -1,6 +1,6 @@
 {
   "name": "@flowingspring/dsh-workspace-memory",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Workspace-scoped durable memory for DeepSeek Harness and optional voice integrations",
   "repository": {
     "type": "git",
