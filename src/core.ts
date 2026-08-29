@@ -178,6 +178,11 @@ const DEFAULT_STATE: Readonly<MemoryState> = Object.freeze({
   seenMessageIds: [],
 })
 
+function debugMemory(event: string, fields: Record<string, unknown>): void {
+  if (process.env.DSH_WORKSPACE_MEMORY_DEBUG !== '1') return
+  console.debug(`[workspace-memory] ${event} ${JSON.stringify(fields)}`)
+}
+
 /** Resolve a stable workspace identity. Empty cwd intentionally means global. */
 export function normalizeWorkspacePath(cwd: string | undefined, platform: NodeJS.Platform = process.platform): string {
   if (typeof cwd !== 'string' || cwd.trim() === '') return ''
@@ -421,6 +426,8 @@ export class WorkspaceMemoryStore {
   readonly now: () => number
   readonly uuid: () => string
   private readonly locks = new Map<string, Promise<unknown>>()
+  private readonly snapshotCache = new Map<string, MemoryScopeSnapshot>()
+  private readonly snapshotGenerations = new Map<string, number>()
 
   constructor(root: string, options: { now?: () => number; uuid?: () => string } = {}) {
     this.root = resolve(root)
@@ -436,7 +443,11 @@ export class WorkspaceMemoryStore {
 
   async withScope<T>(scope: WorkspaceScope, operation: () => Promise<T>): Promise<T> {
     const previous = this.locks.get(scope.key) ?? Promise.resolve()
-    const current = previous.catch(() => {}).then(operation)
+    const queuedAt = this.now()
+    const current = previous.catch(() => {}).then(async () => {
+      debugMemory('scope-lock-acquired', { scope: scope.key, waitMs: Math.max(0, this.now() - queuedAt) })
+      return operation()
+    })
     this.locks.set(scope.key, current)
     try {
       return await current
@@ -449,7 +460,13 @@ export class WorkspaceMemoryStore {
     await mkdir(join(scope.dir, CHECKPOINT_DIR), { recursive: true })
     await mkdir(join(scope.dir, HISTORY_DIR), { recursive: true })
     const descriptor = join(scope.dir, 'scope.json')
-    if (!existsSync(descriptor)) await this.writeAtomic(descriptor, JSON.stringify({ key: scope.key, cwd: scope.cwd }, null, 2) + '\n')
+    if (!existsSync(descriptor)) {
+      try {
+        await writeFile(descriptor, JSON.stringify({ key: scope.key, cwd: scope.cwd }, null, 2) + '\n', { encoding: 'utf8', flag: 'wx' })
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      }
+    }
   }
 
   async readEntries(scope: WorkspaceScope): Promise<MemoryEntry[]> {
@@ -553,12 +570,27 @@ export class WorkspaceMemoryStore {
 
   /** Read one scope without forcing initialization or writing any files. */
   async readSnapshot(scope: WorkspaceScope): Promise<MemoryScopeSnapshot> {
+    const cacheKey = `${scope.key}:${scope.dir}`
+    const cached = this.snapshotCache.get(cacheKey)
+    if (cached !== undefined) return cloneSnapshot(cached)
+    const generation = this.snapshotGenerations.get(cacheKey) ?? 0
+    const startedAt = this.now()
     const [summary, entries, state] = await Promise.all([
       this.readSummary(scope),
       this.readEntries(scope),
       this.readState(scope),
     ])
-    return { scope, summary, entries, state }
+    const snapshot = { scope, summary, entries, state }
+    if ((this.snapshotGenerations.get(cacheKey) ?? 0) === generation) {
+      this.snapshotCache.set(cacheKey, cloneSnapshot(snapshot))
+    }
+    debugMemory('snapshot-loaded', {
+      scope: scope.key,
+      durationMs: Math.max(0, this.now() - startedAt),
+      entries: entries.length,
+      cached: (this.snapshotGenerations.get(cacheKey) ?? 0) === generation,
+    })
+    return cloneSnapshot(snapshot)
   }
 
   /** Read a scope that currently lives in the recoverable archive. */
@@ -567,14 +599,17 @@ export class WorkspaceMemoryStore {
   }
 
   async writeEntries(scope: WorkspaceScope, entries: readonly MemoryEntry[]): Promise<void> {
+    this.invalidateSnapshot(scope)
     await this.writeAtomic(join(scope.dir, ENTRIES_FILE), JSON.stringify(entries, null, 2) + '\n')
   }
 
   async writeState(scope: WorkspaceScope, state: MemoryState): Promise<void> {
+    this.invalidateSnapshot(scope)
     await this.writeAtomic(join(scope.dir, STATE_FILE), JSON.stringify(state, null, 2) + '\n')
   }
 
   async rebuildSummary(scope: WorkspaceScope, entries: readonly MemoryEntry[], maxBytes: number, keepHistory = 10): Promise<void> {
+    this.invalidateSnapshot(scope)
     const file = join(scope.dir, SUMMARY_FILE)
     const previous = await readFile(file, 'utf8').catch(() => '')
     if (previous.trim() !== '') {
@@ -605,6 +640,29 @@ export class WorkspaceMemoryStore {
     const temporary = `${file}.${process.pid}.${this.uuid()}.tmp`
     await writeFile(temporary, text, 'utf8')
     await rename(temporary, file)
+  }
+
+  private invalidateSnapshot(scope: WorkspaceScope): void {
+    const cacheKey = `${scope.key}:${scope.dir}`
+    this.snapshotCache.delete(cacheKey)
+    this.snapshotGenerations.set(cacheKey, (this.snapshotGenerations.get(cacheKey) ?? 0) + 1)
+  }
+}
+
+function cloneSnapshot(snapshot: MemoryScopeSnapshot): MemoryScopeSnapshot {
+  return {
+    scope: { ...snapshot.scope },
+    summary: snapshot.summary,
+    entries: snapshot.entries.map(entry => ({
+      ...entry,
+      ...(entry.retrievalTerms === undefined ? {} : { retrievalTerms: [...entry.retrievalTerms] }),
+      ...(entry.tags === undefined ? {} : { tags: [...entry.tags] }),
+    })),
+    state: {
+      ...snapshot.state,
+      pendingMessages: snapshot.state.pendingMessages.map(message => ({ ...message })),
+      seenMessageIds: [...snapshot.state.seenMessageIds],
+    },
   }
 }
 
@@ -695,6 +753,7 @@ export class WorkspaceMemoryEngine {
   readonly store: WorkspaceMemoryStore
   readonly config: MemoryEngineConfig
   private readonly distill: WorkspaceMemoryEngineOptions['distill']
+  private readonly inFlightMessages = new Map<string, Set<string>>()
 
   constructor(options: WorkspaceMemoryEngineOptions) {
     this.store = options.store
@@ -715,51 +774,54 @@ export class WorkspaceMemoryEngine {
 
   async recall(input: RecallInput): Promise<MemoryContext> {
     const scope = this.store.scope(input.cwd)
-    return this.store.withScope(scope, async () => {
-      await this.store.ensure(scope)
-      const global = this.store.scope('')
-      await this.store.ensure(global)
-      const [workspaceSummary, globalSummary, workspaceEntries, globalEntries] = await Promise.all([
-        this.store.readSummary(scope), this.store.readSummary(global), this.store.readEntries(scope), this.store.readEntries(global),
-      ])
-      const entries = scope.key === 'global' ? globalEntries : [...globalEntries, ...workspaceEntries]
-      const summary = scope.key === 'global' ? globalSummary : [globalSummary, workspaceSummary].filter(value => value.trim() !== '').join('\n\n')
-      const matches = searchEntries(entries, input.query, {
-        limit: input.limit ?? this.config.recallLimit,
-        ...(input.surfacedMemoryIds === undefined ? {} : { surfacedMemoryIds: input.surfacedMemoryIds }),
-        surfacedPenalty: this.config.surfacedPenalty,
-      }).map(({ entry, score }) => ({
-        id: entry.id,
-        scope: entry.scope ?? 'workspace',
-        title: entry.title ?? entry.content.slice(0, 80),
-        description: entry.description ?? entry.content.slice(0, 240),
-        type: entry.type ?? 'fact',
-        content: redactSecrets(entry.content),
-        tags: entry.tags ?? [],
-        importance: entry.importance ?? 1,
-        score,
-      }))
-      const budget = input.maxBytes ?? this.config.recallMaxBytes
-      const boundedSummary = redactSecrets(truncateUtf8(summary, Math.min(budget, this.config.summaryMaxBytes)))
-      let remaining = Math.max(0, budget - Buffer.byteLength(boundedSummary))
-      const boundedMatches: MemoryMatch[] = []
-      for (const match of matches) {
-        const bytes = Buffer.byteLength(JSON.stringify(match))
-        if (bytes > remaining) continue
-        boundedMatches.push(match)
-        remaining -= bytes
-      }
-      return {
-        scope: scope.key,
-        summary: boundedSummary,
-        matches: boundedMatches,
-      }
-    })
+    await this.store.ensure(scope)
+    const global = this.store.scope('')
+    await this.store.ensure(global)
+    const [workspaceSnapshot, globalSnapshot] = await Promise.all([
+      this.store.readSnapshot(scope),
+      this.store.readSnapshot(global),
+    ])
+    const workspaceEntries = workspaceSnapshot.entries
+    const globalEntries = globalSnapshot.entries
+    const entries = scope.key === 'global' ? globalEntries : [...globalEntries, ...workspaceEntries]
+    const summary = scope.key === 'global'
+      ? globalSnapshot.summary
+      : [globalSnapshot.summary, workspaceSnapshot.summary].filter(value => value.trim() !== '').join('\n\n')
+    const matches = searchEntries(entries, input.query, {
+      limit: input.limit ?? this.config.recallLimit,
+      ...(input.surfacedMemoryIds === undefined ? {} : { surfacedMemoryIds: input.surfacedMemoryIds }),
+      surfacedPenalty: this.config.surfacedPenalty,
+    }).map(({ entry, score }) => ({
+      id: entry.id,
+      scope: entry.scope ?? 'workspace',
+      title: entry.title ?? entry.content.slice(0, 80),
+      description: entry.description ?? entry.content.slice(0, 240),
+      type: entry.type ?? 'fact',
+      content: redactSecrets(entry.content),
+      tags: entry.tags ?? [],
+      importance: entry.importance ?? 1,
+      score,
+    }))
+    const budget = input.maxBytes ?? this.config.recallMaxBytes
+    const boundedSummary = redactSecrets(truncateUtf8(summary, Math.min(budget, this.config.summaryMaxBytes)))
+    let remaining = Math.max(0, budget - Buffer.byteLength(boundedSummary))
+    const boundedMatches: MemoryMatch[] = []
+    for (const match of matches) {
+      const bytes = Buffer.byteLength(JSON.stringify(match))
+      if (bytes > remaining) continue
+      boundedMatches.push(match)
+      remaining -= bytes
+    }
+    return {
+      scope: scope.key,
+      summary: boundedSummary,
+      matches: boundedMatches,
+    }
   }
 
   async checkpoint(input: CheckpointInput): Promise<CheckpointResult> {
     const scope = this.store.scope(input.cwd)
-    return this.store.withScope(scope, async () => {
+    const prepared = await this.store.withScope(scope, async () => {
       await this.store.ensure(scope)
       const state = await this.store.readState(scope)
       const known = new Set([...state.seenMessageIds, ...state.pendingMessages.map(message => message.id)])
@@ -772,82 +834,111 @@ export class WorkspaceMemoryEngine {
       }
       if (accepted > 0) state.lastBufferedAt = this.store.now()
       if (accepted === 0 && state.pendingMessages.length === 0) {
-        return { status: 'empty', scope: scope.key, accepted: 0, pending: 0, added: 0, updated: 0, ignored: 0 }
+        return { kind: 'result' as const, result: { status: 'empty' as const, scope: scope.key, accepted: 0, pending: 0, added: 0, updated: 0, ignored: 0 } }
       }
       const eligible = input.force === true || checkpointEligible(state, input.reason, this.config, this.store.now())
       if (!eligible) {
         await this.store.writeState(scope, state)
-        return { status: 'buffered', scope: scope.key, accepted, pending: state.pendingMessages.length, added: 0, updated: 0, ignored: 0 }
+        return { kind: 'result' as const, result: { status: 'buffered' as const, scope: scope.key, accepted, pending: state.pendingMessages.length, added: 0, updated: 0, ignored: 0 } }
       }
-      if (state.pendingMessages.length === 0) {
-        return { status: 'empty', scope: scope.key, accepted, pending: 0, added: 0, updated: 0, ignored: 0 }
+      const claimed = this.inFlightMessages.get(scope.key) ?? new Set<string>()
+      const available = state.pendingMessages.filter(message => !claimed.has(message.id))
+      if (available.length === 0) {
+        if (accepted > 0) await this.store.writeState(scope, state)
+        return { kind: 'result' as const, result: { status: 'buffered' as const, scope: scope.key, accepted, pending: state.pendingMessages.length, added: 0, updated: 0, ignored: 0 } }
       }
       const staged: MemoryMessage[] = []
       let chars = 0
-      for (const message of state.pendingMessages) {
+      for (const message of available) {
         if (chars >= this.config.checkpointMaxChars) break
         const available = this.config.checkpointMaxChars - chars
         const text = message.text.slice(0, available)
         staged.push({ ...message, text })
         chars += text.length
       }
-      let proposals: readonly unknown[]
-      try {
-        proposals = safeArray(await this.distill({ scope, messages: staged, reason: input.reason }))
-      } catch (error) {
+      await this.store.writeState(scope, state)
+      for (const message of staged) claimed.add(message.id)
+      this.inFlightMessages.set(scope.key, claimed)
+      return { kind: 'stage' as const, accepted, staged }
+    })
+    if (prepared.kind === 'result') return prepared.result
+
+    const distillStartedAt = this.store.now()
+    let proposals: readonly unknown[]
+    try {
+      proposals = safeArray(await this.distill({ scope, messages: prepared.staged, reason: input.reason }))
+      debugMemory('distill-complete', { scope: scope.key, durationMs: Math.max(0, this.store.now() - distillStartedAt), messages: prepared.staged.length })
+    } catch (error) {
+      debugMemory('distill-error', { scope: scope.key, durationMs: Math.max(0, this.store.now() - distillStartedAt), error: String(error) })
+      this.releaseClaims(scope, prepared.staged)
+      const state = await this.store.withScope(scope, () => this.store.readState(scope))
+      return {
+        status: 'failed',
+        scope: scope.key,
+        accepted: prepared.accepted,
+        pending: state.pendingMessages.length,
+        added: 0,
+        updated: 0,
+        ignored: 0,
+        error: error instanceof Error ? error.message : String(error),
+      }
+    }
+
+    try {
+      return await this.store.withScope(scope, async () => {
+        await this.store.ensure(scope)
+        const state = await this.store.readState(scope)
+        const entries = await this.store.readEntries(scope)
+        const nowIso = new Date(this.store.now()).toISOString()
+        const workspaceProposals = proposals.filter(proposal => normalizeProposal(proposal)?.scope !== 'global')
+        const globalProposals = proposals.filter(proposal => normalizeProposal(proposal)?.scope === 'global')
+        const result = applyProposals(entries, workspaceProposals, nowIso, this.store.uuid)
+        state.seenMessageIds = [...state.seenMessageIds, ...prepared.staged.map(message => message.id)].slice(-1024)
+        const stagedIds = new Set(prepared.staged.map(message => message.id))
+        state.pendingMessages = state.pendingMessages.filter(message => !stagedIds.has(message.id))
+        state.lastCheckpointAt = this.store.now()
+        state.checkpointCount += 1
+        await this.store.writeEntries(scope, entries)
+        let globalResult: MutationResult = { added: 0, updated: 0, ignored: 0 }
+        if (globalProposals.length > 0 && scope.key !== 'global') {
+          const globalScope = this.store.scope('')
+          globalResult = await this.store.withScope(globalScope, async () => {
+            await this.store.ensure(globalScope)
+            const globalEntries = await this.store.readEntries(globalScope)
+            const globalMutation = applyProposals(globalEntries, globalProposals, nowIso, this.store.uuid)
+            await this.store.writeEntries(globalScope, globalEntries)
+            if (globalMutation.added + globalMutation.updated > 0 || !(await this.store.readSummary(globalScope)).trim()) {
+              await this.store.rebuildSummary(globalScope, globalEntries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
+            }
+            return globalMutation
+          })
+        }
+        if (state.checkpointCount % this.config.consolidateEvery === 0 || !(await this.store.readSummary(scope)).trim()) {
+          state.version += 1
+          await this.store.rebuildSummary(scope, entries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
+        }
+        await this.store.writeCheckpoint(scope, input.reason, prepared.staged, proposals, result)
         await this.store.writeState(scope, state)
         return {
-          status: 'failed',
+          status: 'committed' as const,
           scope: scope.key,
-          accepted,
+          accepted: prepared.accepted,
           pending: state.pendingMessages.length,
-          added: 0,
-          updated: 0,
-          ignored: 0,
-          error: error instanceof Error ? error.message : String(error),
+          added: result.added + globalResult.added,
+          updated: result.updated + globalResult.updated,
+          ignored: result.ignored + globalResult.ignored,
         }
-      }
-      const entries = await this.store.readEntries(scope)
-      const nowIso = new Date(this.store.now()).toISOString()
-      const workspaceProposals = proposals.filter(proposal => normalizeProposal(proposal)?.scope !== 'global')
-      const globalProposals = proposals.filter(proposal => normalizeProposal(proposal)?.scope === 'global')
-      const result = applyProposals(entries, workspaceProposals, nowIso, this.store.uuid)
-      state.seenMessageIds = [...state.seenMessageIds, ...staged.map(message => message.id)].slice(-1024)
-      const stagedIds = new Set(staged.map(message => message.id))
-      state.pendingMessages = state.pendingMessages.filter(message => !stagedIds.has(message.id))
-      state.lastCheckpointAt = this.store.now()
-      state.checkpointCount += 1
-      await this.store.writeEntries(scope, entries)
-      let globalResult: MutationResult = { added: 0, updated: 0, ignored: 0 }
-      if (globalProposals.length > 0 && scope.key !== 'global') {
-        const globalScope = this.store.scope('')
-        globalResult = await this.store.withScope(globalScope, async () => {
-          await this.store.ensure(globalScope)
-          const globalEntries = await this.store.readEntries(globalScope)
-          const result = applyProposals(globalEntries, globalProposals, nowIso, this.store.uuid)
-          await this.store.writeEntries(globalScope, globalEntries)
-          if (result.added + result.updated > 0 || !(await this.store.readSummary(globalScope)).trim()) {
-            await this.store.rebuildSummary(globalScope, globalEntries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
-          }
-          return result
-        })
-      }
-      if (state.checkpointCount % this.config.consolidateEvery === 0 || !(await this.store.readSummary(scope)).trim()) {
-        state.version += 1
-        await this.store.rebuildSummary(scope, entries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
-      }
-      await this.store.writeCheckpoint(scope, input.reason, staged, proposals, result)
-      await this.store.writeState(scope, state)
-      return {
-        status: 'committed',
-        scope: scope.key,
-        accepted,
-        pending: state.pendingMessages.length,
-        added: result.added + globalResult.added,
-        updated: result.updated + globalResult.updated,
-        ignored: result.ignored + globalResult.ignored,
-      }
-    })
+      })
+    } finally {
+      this.releaseClaims(scope, prepared.staged)
+    }
+  }
+
+  private releaseClaims(scope: WorkspaceScope, messages: readonly MemoryMessage[]): void {
+    const claimed = this.inFlightMessages.get(scope.key)
+    if (claimed === undefined) return
+    for (const message of messages) claimed.delete(message.id)
+    if (claimed.size === 0) this.inFlightMessages.delete(scope.key)
   }
 
   async remember(input: RememberInput): Promise<{ scope: string } & MutationResult> {

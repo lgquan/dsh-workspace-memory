@@ -72,7 +72,8 @@ interface WorkspaceMemory {
 
 1. `systemPrompt.context` 注入当前 scope 的稳定摘要。
 2. Agent 第一个 step 根据用户消息调用 `recall`，追加相关条目。
-3. Agent turn 结束时把完整消息交给 checkpoint 缓冲区，响应不会被蒸馏过程阻塞。
+3. Agent turn 结束时把完整消息交给 checkpoint 缓冲区，响应不会被蒸馏过程阻塞。checkpoint
+   只在短暂持锁时认领消息和提交结果，耗时的模型蒸馏在锁外执行；期间新到达的消息继续留在缓冲区。
 4. 达到阶段条件后，蒸馏器提取长期有效事实并更新结构化条目。
 
 ### 普通 Session 与后台 Agent
@@ -83,7 +84,8 @@ interface WorkspaceMemory {
 ### dsh-voco
 
 语音前台在路由前可调用同一个 `workspaceMemory.recall`，将结果作为带边界的参考材料
-提供给路由器；完成的语音 utterance 进入同一 checkpoint 策略，Session 关闭时强制评估
+提供给路由器。前台默认最多等待 250 毫秒，超时后以空记忆继续路由；后台 Agent 仍会在首个
+step 独立检索同一项目记忆。完成的语音 utterance 进入同一 checkpoint 策略，Session 关闭时强制评估
 最后一阶段。服务不存在或调用失败时，voco 保持原有行为。
 
 ## 6. 阶段性 checkpoint
@@ -125,7 +127,8 @@ checkpoint 原文。全局记忆不随项目删除而改变。
 - 凭据形态内容默认拒绝持久化，召回前再次脱敏。
 - 记忆以不可信参考资料注入，不能覆盖当前用户指令。
 - 解析失败、存储失败、检索失败或蒸馏失败只记录日志，不阻断 Agent 或语音回复。
-- checkpoint 输入有硬性字节上限，scope 写入串行化以避免并发覆盖。
+- checkpoint 输入有硬性字节上限，scope 写入串行化以避免并发覆盖；recall 使用写入后失效的
+  不可变内存快照，不进入写锁队列。
 
 ## 10. 验证与发布
 

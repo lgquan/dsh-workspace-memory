@@ -62,7 +62,11 @@ workspace-memory/
 
 Workspace identity is the normalized absolute `cwd`. Runtime data stays out of
 the user's Git checkout unless `memoryDir` is explicitly configured there.
-Writes use a per-scope promise queue and atomic temporary-file rename.
+Writes use a per-scope promise queue and atomic temporary-file rename. Read-only
+recall uses an immutable in-process snapshot cache and does not wait behind the
+scope mutation queue. Checkpointing claims a bounded batch under the queue,
+distils that batch outside the queue, then briefly reacquires the queue to merge
+the result; messages appended while distillation is running remain pending.
 
 When a workspace disappears from the DSH workspace registry, its persisted scope
 is moved from `scopes/` to `archived/`. Archived scopes are excluded from normal
@@ -139,7 +143,10 @@ deduplication, secret checks, and atomic writes remain authoritative.
 
 ## Voco integration
 
-- Before frontend routing, Voco optionally calls `workspaceMemory.recall`.
+- Before frontend routing, Voco optionally calls `workspaceMemory.recall` with a
+  short soft deadline (250 ms by default). A slow or failed recall is treated as
+  empty reference data so the frontend router can continue; the delegated Agent
+  still performs its own first-step retrieval.
 - The returned context is included as quoted reference material for the router.
 - Completed voice utterances are submitted to `checkpoint`; policy remains
   inside the memory module.

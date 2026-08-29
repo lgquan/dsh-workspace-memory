@@ -145,6 +145,90 @@ test('shares memory for the same cwd and isolates another workspace', async () =
   assert.equal(isolated.summary, '')
 })
 
+test('does not block recall while checkpoint distillation is running', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-lock-'))
+  onTestFinished(() => rm(root, { recursive: true, force: true }))
+  const store = new WorkspaceMemoryStore(root)
+  let releaseDistill!: () => void
+  const distillStarted = new Promise<void>(resolve => {
+    releaseDistill = resolve
+  })
+  const engine = new WorkspaceMemoryEngine({
+    store,
+    config: { checkpointTurns: 1 },
+    distill: async () => {
+      await distillStarted
+      return [{ content: '蒸馏完成后的项目事实。' }]
+    },
+  })
+  const cwd = join(root, 'workspace')
+  const checkpoint = engine.checkpoint({
+    cwd,
+    reason: 'task-end',
+    force: true,
+    messages: [{ id: 'u1', role: 'user', text: '记录一条项目事实。' }],
+  })
+  await new Promise<void>(resolve => setImmediate(resolve))
+  const recall = engine.recall({ cwd, query: '项目事实' })
+  try {
+    const result = await Promise.race([
+      recall.then(() => 'resolved' as const),
+      new Promise<'timed-out'>(resolve => setTimeout(() => resolve('timed-out'), 50)),
+    ])
+    assert.equal(result, 'resolved')
+  } finally {
+    releaseDistill()
+  }
+  assert.equal((await checkpoint).status, 'committed')
+})
+
+test('preserves messages appended while an earlier checkpoint is distilling', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-concurrent-'))
+  onTestFinished(() => rm(root, { recursive: true, force: true }))
+  const store = new WorkspaceMemoryStore(root)
+  let signalDistillStarted!: () => void
+  const distillStarted = new Promise<void>(resolve => { signalDistillStarted = resolve })
+  let releaseDistill!: () => void
+  const distillReleased = new Promise<void>(resolve => { releaseDistill = resolve })
+  const engine = new WorkspaceMemoryEngine({
+    store,
+    distill: async () => {
+      signalDistillStarted()
+      await distillReleased
+      return [{ content: '第一批消息形成的长期事实。' }]
+    },
+  })
+  const cwd = join(root, 'workspace')
+  const first = engine.checkpoint({
+    cwd,
+    reason: 'task-end',
+    force: true,
+    messages: [{ id: 'u1', role: 'user', text: '第一批消息。' }],
+  })
+  await distillStarted
+  const second = await engine.checkpoint({
+    cwd,
+    reason: 'segment-end',
+    messages: [{ id: 'u2', role: 'user', text: '蒸馏期间追加的消息。' }],
+  })
+  assert.equal(second.status, 'buffered')
+  assert.equal(second.pending, 2)
+  releaseDistill()
+  const committed = await first
+  assert.equal(committed.pending, 1)
+  const state = await store.readState(store.scope(cwd))
+  assert.deepEqual(state.pendingMessages.map(message => message.id), ['u2'])
+})
+
+test('invalidates the recall snapshot after a memory write', async () => {
+  const f = await fixture()
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace-cache')
+  assert.equal((await f.engine.recall({ cwd, query: '缓存事实' })).matches.length, 0)
+  await f.engine.remember({ cwd, content: '写入后必须立即可见的缓存事实。' })
+  assert.equal((await f.engine.recall({ cwd, query: '缓存事实' })).matches[0]?.content, '写入后必须立即可见的缓存事实。')
+})
+
 test('updates a near-duplicate instead of appending another entry', async () => {
   const f = await fixture({ proposals: [{ content: '项目语音前台会绕过 Agent Loop。', tags: ['voice'], importance: 3 }] })
   onTestFinished(f.cleanup)

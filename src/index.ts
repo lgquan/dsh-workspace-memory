@@ -250,6 +250,8 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
   private readonly store: WorkspaceMemoryStore
   private readonly engine: WorkspaceMemoryEngine
   private readonly surfacedBySession = new Map<string, Set<string>>()
+  private syncOrphanedScopesAt = 0
+  private syncOrphanedScopesPromise: Promise<void> | undefined
 
   constructor(ctx: Context, config: Config = {}) {
     super(ctx, 'workspaceMemory')
@@ -331,12 +333,21 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
 
   /** Move scopes whose workspace registration was deleted into the recoverable archive. */
   private async syncOrphanedScopes(): Promise<void> {
+    const now = Date.now()
+    if (this.syncOrphanedScopesPromise !== undefined) return this.syncOrphanedScopesPromise
+    if (now - this.syncOrphanedScopesAt < 30_000) return
+    this.syncOrphanedScopesAt = now
     const registry = this.ctx.get('workspaceRegistry') as WorkspaceRegistryLike | undefined
     if (registry === undefined) return
-    const active = new Set(registry.list().map(workspace => normalizeWorkspacePath(workspace.path)))
-    for (const scope of await this.store.listScopes()) {
-      if (scope.key !== 'global' && !active.has(normalizeWorkspacePath(scope.cwd))) await this.store.archiveScope(scope)
-    }
+    this.syncOrphanedScopesPromise = (async () => {
+      const active = new Set(registry.list().map(workspace => normalizeWorkspacePath(workspace.path)))
+      for (const scope of await this.store.listScopes()) {
+        if (scope.key !== 'global' && !active.has(normalizeWorkspacePath(scope.cwd))) await this.store.archiveScope(scope)
+      }
+    })().finally(() => {
+      this.syncOrphanedScopesPromise = undefined
+    })
+    return this.syncOrphanedScopesPromise
   }
 
   private async resolveCwd(input: { cwd?: string; sessionId?: SessionId }): Promise<string> {
