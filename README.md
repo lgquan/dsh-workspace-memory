@@ -17,6 +17,7 @@ Session 共享一份稳定摘要和长期原子记忆，并通过可选 Cordis �
 - Agent turn 结束只进入 checkpoint 缓冲，不会每轮强制调用记忆蒸馏模型。
 - LLM 只蒸馏长期有效事实；重复/近重复事实会更新原条目。
 - 提供 `memory_search`、`memory_remember`、`memory_forget` 工具。
+- Web profile 设置中提供“记忆”页面，可查看全局记忆和不同项目的脱敏摘要、结构化条目。
 - 凭据形态内容默认拒绝持久化，并在模型输入前脱敏。
 - 没有安装本插件时，`dsh-voco` 保持原有行为。
 
@@ -88,6 +89,10 @@ workspace-memory/
 
 `memory_entries.json` 是事实来源；`memory_summary.md` 是自动注入的短摘要；
 `checkpoints/` 保留每次阶段性蒸馏的可审计 Markdown 记录。
+
+设置中的“记忆”页面是只读浏览器：前端通过 Host 的内部读取接口访问同一套
+Store，按照 `scope.json` 显示项目目录。它不会直接读写 JSON 文件，也不会展示
+包含完整对话的 checkpoint 原文。
 
 ## 开发验证
 

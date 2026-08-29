@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { Service, type Context } from '@deepseek-ai/cordis'
@@ -19,6 +20,7 @@ import {
   type DistillInput,
   type ForgetInput,
   type MemoryContext,
+  type MemoryEntry,
   type MemoryMessage,
   type RecallInput,
   type RememberInput,
@@ -170,6 +172,54 @@ function outputText(value: string): ContentBlock[] {
   return [{ type: 'text', text: value }]
 }
 
+interface MemoryWebServer {
+  register(route: {
+    kind: 'exact' | 'prefix'
+    path: string
+    handler: (request: IncomingMessage, response: ServerResponse) => void | Promise<void>
+  }): () => void
+}
+
+interface PublicMemoryEntry {
+  id: string
+  scope: string
+  type: string
+  title: string
+  description: string
+  content: string
+  tags: string[]
+  importance: number
+  createdAt?: string
+  updatedAt?: string
+}
+
+function sendJson(response: ServerResponse, status: number, value: unknown): void {
+  const body = JSON.stringify(value)
+  response.statusCode = status
+  response.setHeader('content-type', 'application/json; charset=utf-8')
+  response.setHeader('cache-control', 'no-store')
+  response.end(body)
+}
+
+function publicEntry(entry: MemoryEntry): PublicMemoryEntry {
+  return {
+    id: entry.id,
+    scope: entry.scope ?? 'workspace',
+    type: entry.type ?? 'fact',
+    title: redactSecrets(entry.title ?? entry.content.slice(0, 80)),
+    description: redactSecrets(entry.description ?? entry.content.slice(0, 240)),
+    content: redactSecrets(entry.content),
+    tags: (entry.tags ?? []).map(tag => redactSecrets(tag)),
+    importance: entry.importance ?? 1,
+    ...(entry.createdAt === undefined ? {} : { createdAt: entry.createdAt }),
+    ...(entry.updatedAt === undefined ? {} : { updatedAt: entry.updatedAt }),
+  }
+}
+
+function requestUrl(request: IncomingMessage): URL {
+  return new URL(request.url ?? '/', 'http://localhost')
+}
+
 function readSummaryFile(file: string): string {
   try { return readFileSync(file, 'utf8') } catch { return '' }
 }
@@ -210,6 +260,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
     this.installAgentRetrieval(ctx)
     this.installAgentCheckpointing(ctx)
     this.installTools(ctx)
+    this.installBrowserApi(ctx)
     ctx.effect(() => () => {
       for (const timer of this.idleTimers.values()) clearTimeout(timer)
       this.idleTimers.clear()
@@ -467,6 +518,83 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
     const current = ctx.get('tools')
     if (current !== undefined) install(current)
     ctx.inject(['tools'], toolsCtx => { install(toolsCtx.tools) })
+  }
+
+  /** Expose a redacted, read-only projection for the settings memory browser. */
+  private installBrowserApi(ctx: Context): void {
+    ctx.inject(['webServer'], (hostCtx) => {
+      const webServer = (hostCtx as unknown as { webServer: MemoryWebServer }).webServer
+      const listDisposer = webServer.register({
+        kind: 'exact',
+        path: '/workspace-memory/api/v1/scopes',
+        handler: async (_request, response) => {
+          try {
+            const scopes = await this.store.listScopes()
+            const views = await Promise.all(scopes.map(async (scope) => {
+              const snapshot = await this.store.readSnapshot(scope)
+              const active = snapshot.entries.filter(entry => entry.status !== 'deleted')
+              const updatedAt = active
+                .map(entry => entry.updatedAt ?? entry.createdAt ?? '')
+                .filter(Boolean)
+                .sort()
+                .at(-1)
+              return {
+                key: scope.key,
+                cwd: scope.cwd,
+                kind: scope.key === 'global' ? 'global' : 'workspace',
+                entryCount: active.length,
+                hasSummary: snapshot.summary.trim() !== '',
+                pending: snapshot.state.pendingMessages.length,
+                checkpointCount: snapshot.state.checkpointCount,
+                ...(updatedAt === undefined ? {} : { updatedAt }),
+              }
+            }))
+            sendJson(response, 200, { scopes: views })
+          } catch (error) {
+            ctx.logger.warn('workspace-memory scope listing failed: %o', error)
+            sendJson(response, 500, { error: 'memory scope listing failed' })
+          }
+        },
+      })
+      const scopeDisposer = webServer.register({
+        kind: 'exact',
+        path: '/workspace-memory/api/v1/scope',
+        handler: async (request, response) => {
+          try {
+            const cwd = requestUrl(request).searchParams.get('cwd') ?? ''
+            if (cwd.length > 4096) {
+              sendJson(response, 400, { error: 'cwd is too long' })
+              return
+            }
+            const snapshot = await this.store.readSnapshot(this.store.scope(cwd))
+            const entries = snapshot.entries
+              .filter(entry => entry.status !== 'deleted')
+              .map(publicEntry)
+            sendJson(response, 200, {
+              scope: {
+                key: snapshot.scope.key,
+                cwd: snapshot.scope.cwd,
+                kind: snapshot.scope.key === 'global' ? 'global' : 'workspace',
+              },
+              summary: redactSecrets(truncateUtf8(snapshot.summary, 8000)),
+              entries,
+              state: {
+                pending: snapshot.state.pendingMessages.length,
+                checkpointCount: snapshot.state.checkpointCount,
+                lastCheckpointAt: snapshot.state.lastCheckpointAt,
+              },
+            })
+          } catch (error) {
+            ctx.logger.warn('workspace-memory scope read failed: %o', error)
+            sendJson(response, 500, { error: 'memory scope read failed' })
+          }
+        },
+      })
+      hostCtx.effect(() => () => {
+        listDisposer()
+        scopeDisposer()
+      }, 'workspace-memory browser API')
+    })
   }
 }
 

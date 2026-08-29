@@ -207,6 +207,21 @@ test('merges global and workspace memories while preserving field-aware ranking'
   assert.match(context.summary, /Workspace memory/u)
 })
 
+test('lists persisted scopes and reads an unused scope without creating it', async () => {
+  const f = await fixture()
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace')
+  await f.engine.remember({ scope: 'global', content: '全局偏好。' })
+  await f.engine.remember({ cwd, content: '项目事实。' })
+  const scopes = await f.store.listScopes()
+  assert.deepEqual(scopes.map(scope => scope.key), ['global', f.store.scope(cwd).key])
+  const unused = f.store.scope(join(f.root, 'unused'))
+  const snapshot = await f.store.readSnapshot(unused)
+  assert.equal(snapshot.entries.length, 0)
+  assert.equal(snapshot.summary, '')
+  assert.equal(snapshot.state.pendingMessages.length, 0)
+})
+
 test('supports legacy entries without metadata', async () => {
   const f = await fixture()
   onTestFinished(f.cleanup)

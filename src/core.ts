@@ -127,6 +127,14 @@ export interface WorkspaceScope {
   dir: string
 }
 
+/** Filesystem snapshot used by the optional browser memory inspector. */
+export interface MemoryScopeSnapshot {
+  scope: WorkspaceScope
+  summary: string
+  entries: MemoryEntry[]
+  state: MemoryState
+}
+
 export interface MemoryState {
   version: number
   checkpointCount: number
@@ -468,6 +476,38 @@ export class WorkspaceMemoryStore {
 
   async readSummary(scope: WorkspaceScope): Promise<string> {
     return readFile(join(scope.dir, SUMMARY_FILE), 'utf8').catch(() => '')
+  }
+
+  /** List persisted scopes without creating directories for unused projects. */
+  async listScopes(): Promise<WorkspaceScope[]> {
+    const global = this.scope('')
+    const result: WorkspaceScope[] = [global]
+    const directories = await readdir(join(this.root, 'scopes'), { withFileTypes: true }).catch(() => [])
+    for (const directory of directories) {
+      if (!directory.isDirectory() || !/^ws-[a-f0-9]{20}$/u.test(directory.name)) continue
+      const descriptor = join(this.root, 'scopes', directory.name, 'scope.json')
+      const raw = await readFile(descriptor, 'utf8').catch(() => '')
+      try {
+        const value: unknown = JSON.parse(raw)
+        if (!isRecord(value) || typeof value.cwd !== 'string' || value.cwd.trim() === '') continue
+        const scope = this.scope(value.cwd)
+        if (scope.key !== directory.name) continue
+        result.push(scope)
+      } catch {
+        // Ignore incomplete or manually removed scope descriptors.
+      }
+    }
+    return result.sort((left, right) => left.key === 'global' ? -1 : right.key === 'global' ? 1 : left.cwd.localeCompare(right.cwd))
+  }
+
+  /** Read one scope without forcing initialization or writing any files. */
+  async readSnapshot(scope: WorkspaceScope): Promise<MemoryScopeSnapshot> {
+    const [summary, entries, state] = await Promise.all([
+      this.readSummary(scope),
+      this.readEntries(scope),
+      this.readState(scope),
+    ])
+    return { scope, summary, entries, state }
   }
 
   async writeEntries(scope: WorkspaceScope, entries: readonly MemoryEntry[]): Promise<void> {

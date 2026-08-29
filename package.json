@@ -1,6 +1,6 @@
 {
   "name": "@flowingspring/dsh-workspace-memory",
-  "version": "0.1.0",
+  "version": "0.2.5",
   "description": "Workspace-scoped durable memory for DeepSeek Harness and optional voice integrations",
   "repository": {
     "type": "git",
@@ -30,6 +30,7 @@
       "types": "./lib/types/core.d.ts",
       "default": "./lib/core.js"
     },
+    "./client": "./lib/client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
@@ -41,38 +42,56 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "pnpm typecheck && tsc -p tsconfig.build.json && tsdown",
     "check": "pnpm typecheck && pnpm test",
     "test": "vitest run",
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.client.json"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-agent": "^0.1.1-rc.1",
     "@deepseek-ai/dsh-agent-default-model": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-client-locale": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh-client-runtime": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-settings": "^0.1.1-rc.2",
     "@deepseek-ai/dsh-llm": "^0.1.1-rc.1",
     "@deepseek-ai/dsh-session": "^0.1.1-rc.1",
     "@deepseek-ai/dsh-system-prompt": "^0.1.1-rc.1",
     "@deepseek-ai/dsh-tools": "^0.1.1-rc.1",
-    "@deepseek-ai/schemastery": "^3.18.1"
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "react": "^18.2.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
   },
   "devDependencies": {
     "@types/node": "^22.20.0",
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-agent": "^0.1.1-rc.1",
     "@deepseek-ai/dsh-agent-default-model": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-client-locale": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh-client-runtime": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-settings": "^0.1.1-rc.2",
     "@deepseek-ai/dsh-llm": "^0.1.1-rc.1",
     "@deepseek-ai/dsh-session": "^0.1.1-rc.1",
     "@deepseek-ai/dsh-system-prompt": "^0.1.1-rc.1",
     "@deepseek-ai/dsh-tools": "^0.1.1-rc.1",
     "@deepseek-ai/schemastery": "^3.18.1",
+    "@types/react": "~18.3.1",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.11",
+    "react": "^18.2.0",
+    "tsdown": "^0.22.2"
   },
-  "license": "MIT",
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
-  }
+  "license": "MIT"
 }

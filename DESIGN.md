@@ -104,6 +104,20 @@ rebuilt from active entries. A bounded history is kept before replacement.
 - `memory_search` remains the Agentic second-search seam: an Agent can issue
   alternate queries when the automatic first recall is insufficient.
 
+### Settings memory browser
+
+The Web client contributes a top-level `settings.section` named `记忆`. It reads
+the same store through two loopback, read-only Host routes:
+
+- `GET /workspace-memory/api/v1/scopes` lists the global scope and persisted
+  workspace descriptors.
+- `GET /workspace-memory/api/v1/scope?cwd=...` returns a redacted summary,
+  active entries, and checkpoint counters for one scope.
+
+The browser never opens checkpoint Markdown or writes the JSON files directly.
+Mutations continue to go through the memory engine so its per-scope locks,
+deduplication, secret checks, and atomic writes remain authoritative.
+
 ## Voco integration
 
 - Before frontend routing, Voco optionally calls `workspaceMemory.recall`.
