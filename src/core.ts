@@ -359,12 +359,12 @@ function archivedScopeDirectory(root: string, key: string): string {
   return join(root, ARCHIVE_DIR, key)
 }
 
-function deterministicSummary(entries: readonly MemoryEntry[], maxBytes: number, heading = '# Workspace memory'): string {
+function deterministicSummary(entries: readonly MemoryEntry[], maxBytes: number, heading = '# 项目记忆'): string {
   const active = entries
     .filter(entry => entry.status !== 'deleted')
     .sort((left, right) => Number(right.importance ?? 1) - Number(left.importance ?? 1)
       || String(right.updatedAt).localeCompare(String(left.updatedAt)))
-  const lines = [heading, '', 'Durable reference facts maintained by dsh-workspace-memory.', '']
+  const lines = [heading, '', '由 dsh-workspace-memory 维护的长期事实。', '']
   for (const entry of active) {
     const tags = (entry.tags ?? []).length > 0 ? ` [${entry.tags?.join(', ')}]` : ''
     const candidate = `- ${entry.title ?? entry.content}: ${entry.description ?? entry.content}${tags}`
@@ -480,7 +480,11 @@ export class WorkspaceMemoryStore {
   }
 
   async readSummary(scope: WorkspaceScope): Promise<string> {
-    return readFile(join(scope.dir, SUMMARY_FILE), 'utf8').catch(() => '')
+    const raw = await readFile(join(scope.dir, SUMMARY_FILE), 'utf8').catch(() => '')
+    return raw
+      .replace(/^# Global memory$/mu, '# 全局记忆')
+      .replace(/^# Workspace memory$/mu, '# 项目记忆')
+      .replace(/^Durable reference facts maintained by dsh-workspace-memory\.$/mu, '由 dsh-workspace-memory 维护的长期事实。')
   }
 
   /** List persisted scopes without creating directories for unused projects. */
@@ -577,7 +581,7 @@ export class WorkspaceMemoryStore {
       const history = join(scope.dir, HISTORY_DIR, `${String(this.now())}-${this.uuid()}.md`)
       await this.writeAtomic(history, previous)
     }
-    await this.writeAtomic(file, deterministicSummary(entries, maxBytes, scope.key === 'global' ? '# Global memory' : '# Workspace memory'))
+    await this.writeAtomic(file, deterministicSummary(entries, maxBytes, scope.key === 'global' ? '# 全局记忆' : '# 项目记忆'))
     const historyFiles = (await readdir(join(scope.dir, HISTORY_DIR)).catch(() => [])).sort().reverse()
     for (const stale of historyFiles.slice(Math.max(0, keepHistory))) {
       await unlink(join(scope.dir, HISTORY_DIR, stale)).catch(() => {})
