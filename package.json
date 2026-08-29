@@ -1,6 +1,6 @@
 {
   "name": "@flowingspring/dsh-workspace-memory",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "Workspace-scoped durable memory for DeepSeek Harness and optional voice integrations",
   "homepage": "https://www.npmjs.com/package/@flowingspring/dsh-workspace-memory",
   "repository": {
