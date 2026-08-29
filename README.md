@@ -4,8 +4,6 @@
 Session 共享一份稳定摘要和长期原子记忆，并通过可选 Cordis 接口与
 [`dsh-voco`](https://github.com/lgquan/dsh-voco#readme) 的语音前台集成。
 
-NPM 包：[https://www.npmjs.com/package/@flowingspring/dsh-workspace-memory](https://www.npmjs.com/package/@flowingspring/dsh-workspace-memory)
-
 ## 当前能力
 
 - 按规范化 `cwd` 隔离 Workspace；相同 Workspace 的 Voice Session、后台
@@ -31,7 +29,7 @@ NPM 包：[https://www.npmjs.com/package/@flowingspring/dsh-workspace-memory](ht
 ## 安装（NPM）
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.8
+dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.9
 ```
 
 安装后重启 `dsh web`。也可以在 [NPM 页面](https://www.npmjs.com/package/@flowingspring/dsh-workspace-memory)
