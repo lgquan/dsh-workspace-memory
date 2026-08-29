@@ -50,11 +50,26 @@ workspace-memory/
       state.json
       checkpoints/
       summary_history/
+  archived/
+    ws-<sha256-prefix>/
+      scope.json
+      memory_summary.md
+      memory_entries.json
+      state.json
+      checkpoints/
+      summary_history/
 ```
 
 Workspace identity is the normalized absolute `cwd`. Runtime data stays out of
 the user's Git checkout unless `memoryDir` is explicitly configured there.
 Writes use a per-scope promise queue and atomic temporary-file rename.
+
+When a workspace disappears from the DSH workspace registry, its persisted scope
+is moved from `scopes/` to `archived/`. Archived scopes are excluded from normal
+recall and active-scope listings, but remain readable through the settings
+recycle bin. A confirmed purge physically removes the archived directory and
+all of its checkpoints and summary history. The global scope is never archived
+or removed by workspace cleanup.
 
 ## Retrieval
 
@@ -113,6 +128,10 @@ the same store through two loopback, read-only Host routes:
   workspace descriptors.
 - `GET /workspace-memory/api/v1/scope?cwd=...` returns a redacted summary,
   active entries, and checkpoint counters for one scope.
+- `GET /workspace-memory/api/v1/archived-scopes` lists workspace scopes in the
+  recoverable archive.
+- `GET /workspace-memory/api/v1/archived-scope?key=...` reads one archived
+  scope, and `DELETE` permanently purges it after UI confirmation.
 
 The browser never opens checkpoint Markdown or writes the JSON files directly.
 Mutations continue to go through the memory engine so its per-scope locks,

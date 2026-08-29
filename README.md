@@ -2,7 +2,9 @@
 
 面向 DeepSeek Harness 的 Workspace 长期记忆插件。它让相同工作目录下的多个
 Session 共享一份稳定摘要和长期原子记忆，并通过可选 Cordis 接口与
-[`dsh-voco`](../dsh-voco/README.md) 的语音前台集成。
+[`dsh-voco`](https://github.com/lgquan/dsh-voco#readme) 的语音前台集成。
+
+NPM 包：[https://www.npmjs.com/package/@flowingspring/dsh-workspace-memory](https://www.npmjs.com/package/@flowingspring/dsh-workspace-memory)
 
 ## 当前能力
 
@@ -18,12 +20,24 @@ Session 共享一份稳定摘要和长期原子记忆，并通过可选 Cordis �
 - LLM 只蒸馏长期有效事实；重复/近重复事实会更新原条目。
 - 提供 `memory_search`、`memory_remember`、`memory_forget` 工具。
 - Web profile 设置中提供“记忆”页面，可查看全局记忆和不同项目的脱敏摘要、结构化条目。
+- 设置页面可以从全局范围选择任意已记录的项目；记忆浏览不依赖当前打开的会话。
+- 工作区从 DSH 注册表中删除后，其孤立的项目记忆会移动到回收区；回收区支持查看，确认后可永久删除。
 - 凭据形态内容默认拒绝持久化，并在模型输入前脱敏。
 - 没有安装本插件时，`dsh-voco` 保持原有行为。
 
 详细契约见 [DESIGN.md](./DESIGN.md)。
+完整模块说明见 [DOCS/ARCHITECTURE.md](./DOCS/ARCHITECTURE.md)。
 
-## 安装（当前源码版本）
+## 安装（NPM）
+
+```powershell
+dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.8
+```
+
+安装后重启 `dsh web`。也可以在 [NPM 页面](https://www.npmjs.com/package/@flowingspring/dsh-workspace-memory)
+查看当前发布版本。
+
+## 从源码安装
 
 ```powershell
 pnpm install
@@ -82,6 +96,14 @@ workspace-memory/
         ├── state.json
         ├── checkpoints/
         └── summary_history/
+└── archived/
+    └── ws-<hash>/
+        ├── scope.json
+        ├── memory_summary.md
+        ├── memory_entries.json
+        ├── state.json
+        ├── checkpoints/
+        └── summary_history/
 ```
 
 项目 Session 会同时读取 `global/` 与对应 `scopes/ws-<hash>/` 的摘要和长期记忆；
@@ -92,7 +114,10 @@ workspace-memory/
 
 设置中的“记忆”页面是只读浏览器：前端通过 Host 的内部读取接口访问同一套
 Store，按照 `scope.json` 显示项目目录。它不会直接读写 JSON 文件，也不会展示
-包含完整对话的 checkpoint 原文。
+包含完整对话的 checkpoint 原文。删除项目后，项目记忆会从 `scopes/` 移到
+`archived/`，因此不再出现在活动项目列表中，但仍可在设置的“回收区”查看。点击
+“永久删除”并确认后，会物理删除该项目的摘要、结构化记忆、checkpoint 和摘要历史，
+且无法恢复。全局记忆不会随任何项目删除。
 
 ## 开发验证
 
