@@ -21,6 +21,11 @@ const zh = {
   loading: '正在读取…',
   failed: '读取记忆失败',
   retry: '重试',
+  activeView: '记忆',
+  archiveView: '回收区',
+  archiveEmpty: '回收区为空',
+  purge: '永久删除',
+  purgeConfirm: '确定永久删除这个项目的全部记忆吗？此操作无法撤销。',
   pending: '待整理',
   checkpoints: '整理次数',
   updated: '最近更新',
@@ -45,6 +50,11 @@ const en = {
   loading: 'Loading…',
   failed: 'Unable to read memory',
   retry: 'Retry',
+  activeView: 'Memory',
+  archiveView: 'Recycle bin',
+  archiveEmpty: 'Recycle bin is empty',
+  purge: 'Delete permanently',
+  purgeConfirm: 'Permanently delete all memory for this project? This cannot be undone.',
   pending: 'Pending',
   checkpoints: 'Checkpoints',
   updated: 'Last updated',
@@ -85,6 +95,8 @@ interface ScopePayload {
   state: { pending: number; checkpointCount: number; lastCheckpointAt: number }
 }
 
+type MemoryView = 'active' | 'archived'
+
 interface SlotsLike {
   inject(slot: string, register: () => unknown): void
   register(options: Record<string, unknown>, component: () => unknown): unknown
@@ -124,6 +136,10 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
   const [scopes, setScopes] = useState<ScopeInfo[]>([])
   const [selectedKey, setSelectedKey] = useState('global')
   const [payload, setPayload] = useState<ScopePayload | undefined>()
+  const [archivedScopes, setArchivedScopes] = useState<ScopeInfo[]>([])
+  const [archivedSelectedKey, setArchivedSelectedKey] = useState('')
+  const [archivedPayload, setArchivedPayload] = useState<ScopePayload | undefined>()
+  const [view, setView] = useState<MemoryView>('active')
   const [query, setQuery] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(false)
@@ -138,6 +154,19 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
   const loadScope = async (cwd: string): Promise<ScopePayload> => {
     const response = await fetch(`/workspace-memory/api/v1/scope?cwd=${encodeURIComponent(cwd)}`)
     if (!response.ok) throw new Error(`scope read failed (${response.status})`)
+    return await response.json() as ScopePayload
+  }
+
+  const loadArchivedScopes = async (): Promise<ScopeInfo[]> => {
+    const response = await fetch('/workspace-memory/api/v1/archived-scopes')
+    if (!response.ok) throw new Error(`archived scope list failed (${response.status})`)
+    const result = await response.json() as { scopes?: ScopeInfo[] }
+    return Array.isArray(result.scopes) ? result.scopes : []
+  }
+
+  const loadArchivedScope = async (key: string): Promise<ScopePayload> => {
+    const response = await fetch(`/workspace-memory/api/v1/archived-scope?key=${encodeURIComponent(key)}`)
+    if (!response.ok) throw new Error(`archived scope read failed (${response.status})`)
     return await response.json() as ScopePayload
   }
 
@@ -157,6 +186,28 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
     }
   }
 
+  const reloadArchived = async (key?: string): Promise<void> => {
+    setLoading(true)
+    setError(false)
+    try {
+      const nextScopes = await loadArchivedScopes()
+      setArchivedScopes(nextScopes)
+      const nextKey = key ?? (archivedSelectedKey !== '' ? archivedSelectedKey : nextScopes[0]?.key) ?? ''
+      if (nextKey === '') {
+        setArchivedSelectedKey('')
+        setArchivedPayload(undefined)
+      } else {
+        const next = await loadArchivedScope(nextKey)
+        setArchivedSelectedKey(next.scope.key)
+        setArchivedPayload(next)
+      }
+    } catch {
+      setError(true)
+    } finally {
+      setLoading(false)
+    }
+  }
+
   useEffect(() => {
     void reload()
     // Memory browsing is independent from the currently open session.
@@ -168,18 +219,50 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
     return [...known.values()]
   }, [scopes])
 
+  const archivedOptions = useMemo(() => archivedScopes, [archivedScopes])
+
+  const displayedPayload = view === 'active' ? payload : archivedPayload
+  const displayedOptions = view === 'active' ? options : archivedOptions
+  const displayedKey = view === 'active' ? selectedKey : archivedSelectedKey
+
   const filteredEntries = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase()
-    if (normalized === '') return payload?.entries ?? []
-    return (payload?.entries ?? []).filter(entry => [entry.title, entry.description, entry.content, ...entry.tags]
+    if (normalized === '') return displayedPayload?.entries ?? []
+    return (displayedPayload?.entries ?? []).filter(entry => [entry.title, entry.description, entry.content, ...entry.tags]
       .join(' ').toLocaleLowerCase().includes(normalized))
-  }, [payload, query])
+  }, [displayedPayload, query])
 
   const onSelect = (key: string): void => {
     const option = options.find(scope => scope.key === key)
     if (option === undefined) return
     setSelectedKey(key)
     void reload(option.cwd)
+  }
+
+  const onSelectArchived = (key: string): void => {
+    if (!archivedOptions.some(scope => scope.key === key)) return
+    setArchivedSelectedKey(key)
+    void reloadArchived(key)
+  }
+
+  const showArchived = (): void => {
+    setView('archived')
+    if (archivedPayload === undefined) void reloadArchived()
+  }
+
+  const purge = async (): Promise<void> => {
+    const confirm = (globalThis as unknown as { confirm?: (message: string) => boolean }).confirm
+    if (archivedSelectedKey === '' || (confirm !== undefined && !confirm(t('purgeConfirm')))) return
+    setLoading(true)
+    setError(false)
+    try {
+      const response = await fetch(`/workspace-memory/api/v1/archived-scope?key=${encodeURIComponent(archivedSelectedKey)}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(`archived scope delete failed (${response.status})`)
+      await reloadArchived()
+    } catch {
+      setError(true)
+      setLoading(false)
+    }
   }
 
   const colors = {
@@ -194,37 +277,42 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
     h('header', { style: { display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 16, marginBottom: 18 } },
       h('div', null,
         h('h2', { style: { margin: 0, fontSize: 20, fontWeight: 650 } }, t('title')),
-        h('p', { style: { margin: '6px 0 0', color: colors.secondary, fontSize: 12, wordBreak: 'break-all' } }, payload?.scope.cwd || t('global')),
+        h('p', { style: { margin: '6px 0 0', color: colors.secondary, fontSize: 12, wordBreak: 'break-all' } }, displayedPayload?.scope.cwd || t('global')),
       ),
       h('button', {
-        type: 'button', title: t('refresh'), 'aria-label': t('refresh'), onClick: () => { void reload() },
+        type: 'button', title: t('refresh'), 'aria-label': t('refresh'), onClick: () => { void (view === 'active' ? reload() : reloadArchived()) },
         style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 34, height: 34, border: `1px solid ${colors.border}`, borderRadius: 6, background: 'transparent', color: colors.text, cursor: 'pointer' },
       }, iconRefresh()),
+    ),
+    h('div', { style: { display: 'flex', gap: 6, marginBottom: 16 } },
+      h('button', { type: 'button', onClick: () => setView('active'), 'aria-pressed': view === 'active', style: { padding: '7px 11px', border: `1px solid ${colors.border}`, borderRadius: 6, background: view === 'active' ? colors.surface : 'transparent', color: colors.text, cursor: 'pointer' } }, t('activeView')),
+      h('button', { type: 'button', onClick: showArchived, 'aria-pressed': view === 'archived', style: { padding: '7px 11px', border: `1px solid ${colors.border}`, borderRadius: 6, background: view === 'archived' ? colors.surface : 'transparent', color: colors.text, cursor: 'pointer' } }, t('archiveView')),
     ),
     h('div', { style: { display: 'grid', gap: 8, marginBottom: 18 } },
       h('label', { style: { color: colors.secondary, fontSize: 12 } }, t('scope')),
       h('select', {
-        value: selectedKey, onChange: (event: Event) => { onSelect((event.target as unknown as { value: string }).value) },
+        value: displayedKey, onChange: (event: Event) => { const key = (event.target as unknown as { value: string }).value; if (view === 'active') onSelect(key); else onSelectArchived(key) },
         style: { minHeight: 38, padding: '0 10px', color: colors.text, background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 6 },
-      }, options.length === 0
-        ? h('option', { value: '' }, t('emptyScopes'))
-        : options.map(scope => h('option', { key: scope.key, value: scope.key }, scope.kind === 'global' ? t('global') : workspaceName(scope.cwd, t('workspace')))),
+      }, displayedOptions.length === 0
+        ? h('option', { value: '' }, view === 'active' ? t('emptyScopes') : t('archiveEmpty'))
+        : displayedOptions.map(scope => h('option', { key: scope.key, value: scope.key }, scope.kind === 'global' ? t('global') : workspaceName(scope.cwd, t('workspace')))),
       ),
     ),
     error && h('div', { role: 'alert', style: { padding: 12, border: `1px solid ${colors.border}`, borderRadius: 6, color: colors.secondary, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 } },
       h('span', null, t('failed')),
-      h('button', { type: 'button', onClick: () => { void reload() }, style: { color: colors.accent, background: 'transparent', border: 0, cursor: 'pointer' } }, t('retry')),
+      h('button', { type: 'button', onClick: () => { void (view === 'active' ? reload() : reloadArchived()) }, style: { color: colors.accent, background: 'transparent', border: 0, cursor: 'pointer' } }, t('retry')),
     ),
     loading && h('p', { style: { color: colors.secondary } }, t('loading')),
     !loading && !error && h('div', { style: { display: 'grid', gap: 16 } },
       h('div', { style: { display: 'flex', gap: 16, color: colors.secondary, fontSize: 12, flexWrap: 'wrap' } },
-        h('span', null, `${payload?.entries.length ?? 0}${t('count')}`),
-        h('span', null, `${t('pending')}: ${payload?.state.pending ?? 0}`),
-        h('span', null, `${t('checkpoints')}: ${payload?.state.checkpointCount ?? 0}`),
+        h('span', null, `${displayedPayload?.entries.length ?? 0}${t('count')}`),
+        h('span', null, `${t('pending')}: ${displayedPayload?.state.pending ?? 0}`),
+        h('span', null, `${t('checkpoints')}: ${displayedPayload?.state.checkpointCount ?? 0}`),
       ),
+      view === 'archived' && displayedPayload !== undefined && h('button', { type: 'button', onClick: () => { void purge() }, style: { justifySelf: 'start', color: '#ff8f8f', background: 'transparent', border: `1px solid ${colors.border}`, borderRadius: 6, padding: '7px 11px', cursor: 'pointer' } }, t('purge')),
       h('article', { style: { border: `1px solid ${colors.border}`, borderRadius: 6, padding: 14, background: colors.surface } },
         h('h3', { style: { margin: '0 0 10px', fontSize: 14 } }, t('summary')),
-        h('pre', { style: { margin: 0, color: colors.secondary, whiteSpace: 'pre-wrap', wordBreak: 'break-word', font: 'inherit', lineHeight: 1.55 } }, payload?.summary.trim() || t('noSummary')),
+        h('pre', { style: { margin: 0, color: colors.secondary, whiteSpace: 'pre-wrap', wordBreak: 'break-word', font: 'inherit', lineHeight: 1.55 } }, displayedPayload?.summary.trim() || t('noSummary')),
       ),
       h('div', { style: { display: 'grid', gap: 10 } },
         h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 } },

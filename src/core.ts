@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, normalize, resolve } from 'node:path'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 
@@ -167,6 +167,7 @@ export const ENTRIES_FILE = 'memory_entries.json'
 export const STATE_FILE = 'state.json'
 export const CHECKPOINT_DIR = 'checkpoints'
 export const HISTORY_DIR = 'summary_history'
+export const ARCHIVE_DIR = 'archived'
 
 const DEFAULT_STATE: Readonly<MemoryState> = Object.freeze({
   version: 0,
@@ -354,6 +355,10 @@ function scopeDirectory(root: string, key: string): string {
   return key === 'global' ? join(root, 'global') : join(root, 'scopes', key)
 }
 
+function archivedScopeDirectory(root: string, key: string): string {
+  return join(root, ARCHIVE_DIR, key)
+}
+
 function deterministicSummary(entries: readonly MemoryEntry[], maxBytes: number, heading = '# Workspace memory'): string {
   const active = entries
     .filter(entry => entry.status !== 'deleted')
@@ -500,6 +505,48 @@ export class WorkspaceMemoryStore {
     return result.sort((left, right) => left.key === 'global' ? -1 : right.key === 'global' ? 1 : left.cwd.localeCompare(right.cwd))
   }
 
+  /** List workspace scopes moved to the recoverable archive. */
+  async listArchivedScopes(): Promise<WorkspaceScope[]> {
+    const result: WorkspaceScope[] = []
+    const directories = await readdir(join(this.root, ARCHIVE_DIR), { withFileTypes: true }).catch(() => [])
+    for (const directory of directories) {
+      if (!directory.isDirectory() || !/^ws-[a-f0-9]{20}$/u.test(directory.name)) continue
+      const descriptor = join(archivedScopeDirectory(this.root, directory.name), 'scope.json')
+      const raw = await readFile(descriptor, 'utf8').catch(() => '')
+      try {
+        const value: unknown = JSON.parse(raw)
+        if (!isRecord(value) || typeof value.cwd !== 'string' || value.cwd.trim() === '') continue
+        const scope = this.scope(value.cwd)
+        if (scope.key === directory.name) result.push(scope)
+      } catch {
+        // Ignore incomplete archive descriptors.
+      }
+    }
+    return result.sort((left, right) => left.cwd.localeCompare(right.cwd))
+  }
+
+  /** Move one workspace scope to the recoverable archive. */
+  async archiveScope(scope: WorkspaceScope): Promise<boolean> {
+    if (scope.key === 'global' || !existsSync(scope.dir)) return false
+    return this.withScope(scope, async () => {
+      if (!existsSync(scope.dir)) return false
+      const destination = archivedScopeDirectory(this.root, scope.key)
+      await mkdir(join(this.root, ARCHIVE_DIR), { recursive: true })
+      if (existsSync(destination)) return false
+      await rename(scope.dir, destination)
+      return true
+    })
+  }
+
+  /** Permanently remove one archived scope and all of its history/checkpoints. */
+  async purgeArchivedScope(scope: WorkspaceScope): Promise<boolean> {
+    if (scope.key === 'global') return false
+    const directory = archivedScopeDirectory(this.root, scope.key)
+    if (!existsSync(directory)) return false
+    await rm(directory, { recursive: true, force: true })
+    return true
+  }
+
   /** Read one scope without forcing initialization or writing any files. */
   async readSnapshot(scope: WorkspaceScope): Promise<MemoryScopeSnapshot> {
     const [summary, entries, state] = await Promise.all([
@@ -508,6 +555,11 @@ export class WorkspaceMemoryStore {
       this.readState(scope),
     ])
     return { scope, summary, entries, state }
+  }
+
+  /** Read a scope that currently lives in the recoverable archive. */
+  async readArchivedSnapshot(scope: WorkspaceScope): Promise<MemoryScopeSnapshot> {
+    return this.readSnapshot({ ...scope, dir: archivedScopeDirectory(this.root, scope.key) })
   }
 
   async writeEntries(scope: WorkspaceScope, entries: readonly MemoryEntry[]): Promise<void> {

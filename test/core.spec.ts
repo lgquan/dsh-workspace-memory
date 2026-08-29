@@ -222,6 +222,21 @@ test('lists persisted scopes and reads an unused scope without creating it', asy
   assert.equal(snapshot.state.pendingMessages.length, 0)
 })
 
+test('archives a workspace scope and permanently purges it on request', async () => {
+  const f = await fixture()
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace')
+  await f.engine.remember({ cwd, content: '可恢复的项目记忆。' })
+  const scope = f.store.scope(cwd)
+  assert.equal((await f.store.archiveScope(scope)), true)
+  assert.deepEqual(await f.store.listScopes(), [f.store.scope('')])
+  const archived = await f.store.listArchivedScopes()
+  assert.equal(archived[0]?.key, scope.key)
+  assert.match((await f.store.readArchivedSnapshot(scope)).summary, /Workspace memory/u)
+  assert.equal(await f.store.purgeArchivedScope(scope), true)
+  assert.equal((await f.store.listArchivedScopes()).length, 0)
+})
+
 test('supports legacy entries without metadata', async () => {
   const f = await fixture()
   onTestFinished(f.cleanup)

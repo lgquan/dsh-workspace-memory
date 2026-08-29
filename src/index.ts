@@ -22,6 +22,7 @@ import {
   type MemoryContext,
   type MemoryEntry,
   type MemoryMessage,
+  normalizeWorkspacePath,
   type RecallInput,
   type RememberInput,
   type WorkspaceMemory,
@@ -180,6 +181,10 @@ interface MemoryWebServer {
   }): () => void
 }
 
+interface WorkspaceRegistryLike {
+  list(): ReadonlyArray<{ path: string }>
+}
+
 interface PublicMemoryEntry {
   id: string
   scope: string
@@ -271,6 +276,8 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
 
   async recall(input: RecallInput): Promise<MemoryContext> {
     const cwd = await this.resolveCwd(input)
+    await this.syncOrphanedScopes()
+    if (cwd !== '' && await this.isArchivedCwd(cwd)) return this.engine.recall({ ...input, cwd: '' })
     try {
       const surfaced = input.sessionId === undefined ? undefined : [...(this.surfacedBySession.get(String(input.sessionId)) ?? [])]
       const result = await this.engine.recall({ ...input, cwd, ...(surfaced === undefined ? {} : { surfacedMemoryIds: surfaced }) })
@@ -293,6 +300,10 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
 
   async checkpoint(input: CheckpointInput): Promise<CheckpointResult> {
     const cwd = await this.resolveCwd(input)
+    await this.syncOrphanedScopes()
+    if (cwd !== '' && await this.isArchivedCwd(cwd)) {
+      return { status: 'empty', scope: this.store.scope(cwd).key, accepted: 0, pending: 0, added: 0, updated: 0, ignored: 0 }
+    }
     const result = await this.engine.checkpoint({ ...input, cwd })
     this.updateIdleTimer(cwd, result)
     if (result.status === 'failed') this.ctx.logger.warn('workspace-memory checkpoint failed: %s', result.error)
@@ -300,11 +311,32 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
   }
 
   async remember(input: RememberInput): ReturnType<WorkspaceMemoryEngine['remember']> {
-    return this.engine.remember({ ...input, cwd: await this.resolveCwd(input) })
+    const cwd = await this.resolveCwd(input)
+    await this.syncOrphanedScopes()
+    if (cwd !== '' && await this.isArchivedCwd(cwd)) return { scope: this.store.scope(cwd).key, added: 0, updated: 0, ignored: 1 }
+    return this.engine.remember({ ...input, cwd })
   }
 
   async forget(input: ForgetInput): ReturnType<WorkspaceMemoryEngine['forget']> {
-    return this.engine.forget({ ...input, cwd: await this.resolveCwd(input) })
+    const cwd = await this.resolveCwd(input)
+    await this.syncOrphanedScopes()
+    if (cwd !== '' && await this.isArchivedCwd(cwd)) return { scope: this.store.scope(cwd).key, deleted: false }
+    return this.engine.forget({ ...input, cwd })
+  }
+
+  private async isArchivedCwd(cwd: string): Promise<boolean> {
+    const key = this.store.scope(cwd).key
+    return (await this.store.listArchivedScopes()).some(scope => scope.key === key)
+  }
+
+  /** Move scopes whose workspace registration was deleted into the recoverable archive. */
+  private async syncOrphanedScopes(): Promise<void> {
+    const registry = this.ctx.get('workspaceRegistry') as WorkspaceRegistryLike | undefined
+    if (registry === undefined) return
+    const active = new Set(registry.list().map(workspace => normalizeWorkspacePath(workspace.path)))
+    for (const scope of await this.store.listScopes()) {
+      if (scope.key !== 'global' && !active.has(normalizeWorkspacePath(scope.cwd))) await this.store.archiveScope(scope)
+    }
   }
 
   private async resolveCwd(input: { cwd?: string; sessionId?: SessionId }): Promise<string> {
@@ -529,6 +561,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
         path: '/workspace-memory/api/v1/scopes',
         handler: async (_request, response) => {
           try {
+            await this.syncOrphanedScopes()
             const scopes = await this.store.listScopes()
             const views = await Promise.all(scopes.map(async (scope) => {
               const snapshot = await this.store.readSnapshot(scope)
@@ -553,6 +586,32 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
           } catch (error) {
             ctx.logger.warn('workspace-memory scope listing failed: %o', error)
             sendJson(response, 500, { error: 'memory scope listing failed' })
+          }
+        },
+      })
+      const archivedListDisposer = webServer.register({
+        kind: 'exact',
+        path: '/workspace-memory/api/v1/archived-scopes',
+        handler: async (_request, response) => {
+          try {
+            const scopes = await this.store.listArchivedScopes()
+            const views = await Promise.all(scopes.map(async (scope) => {
+              const snapshot = await this.store.readArchivedSnapshot(scope)
+              const active = snapshot.entries.filter(entry => entry.status !== 'deleted')
+              return {
+                key: scope.key,
+                cwd: scope.cwd,
+                kind: 'workspace',
+                entryCount: active.length,
+                hasSummary: snapshot.summary.trim() !== '',
+                pending: snapshot.state.pendingMessages.length,
+                checkpointCount: snapshot.state.checkpointCount,
+              }
+            }))
+            sendJson(response, 200, { scopes: views })
+          } catch (error) {
+            ctx.logger.warn('workspace-memory archived scope listing failed: %o', error)
+            sendJson(response, 500, { error: 'archived memory scope listing failed' })
           }
         },
       })
@@ -590,9 +649,43 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
           }
         },
       })
+      const archivedScopeDisposer = webServer.register({
+        kind: 'exact',
+        path: '/workspace-memory/api/v1/archived-scope',
+        handler: async (request, response) => {
+          const key = requestUrl(request).searchParams.get('key') ?? ''
+          const scope = (await this.store.listArchivedScopes()).find(item => item.key === key)
+          if (scope === undefined) {
+            sendJson(response, 404, { error: 'archived memory scope not found' })
+            return
+          }
+          if (request.method === 'DELETE') {
+            const deleted = await this.store.purgeArchivedScope(scope)
+            sendJson(response, deleted ? 200 : 404, { deleted })
+            return
+          }
+          if (request.method !== 'GET') {
+            sendJson(response, 405, { error: 'method not allowed' })
+            return
+          }
+          const snapshot = await this.store.readArchivedSnapshot(scope)
+          sendJson(response, 200, {
+            scope: { key: scope.key, cwd: scope.cwd, kind: 'workspace' },
+            summary: redactSecrets(truncateUtf8(snapshot.summary, 8000)),
+            entries: snapshot.entries.filter(entry => entry.status !== 'deleted').map(publicEntry),
+            state: {
+              pending: snapshot.state.pendingMessages.length,
+              checkpointCount: snapshot.state.checkpointCount,
+              lastCheckpointAt: snapshot.state.lastCheckpointAt,
+            },
+          })
+        },
+      })
       hostCtx.effect(() => () => {
         listDisposer()
+        archivedListDisposer()
         scopeDisposer()
+        archivedScopeDisposer()
       }, 'workspace-memory browser API')
     })
   }
