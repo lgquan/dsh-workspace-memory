@@ -86,7 +86,14 @@ interface WorkspaceMemory {
 语音前台在路由前可调用同一个 `workspaceMemory.recall`，将结果作为带边界的参考材料
 提供给路由器。前台默认最多等待 250 毫秒，超时后以空记忆继续路由；后台 Agent 仍会在首个
 step 独立检索同一项目记忆。完成的语音 utterance 进入同一 checkpoint 策略，Session 关闭时强制评估
-最后一阶段。服务不存在或调用失败时，voco 保持原有行为。
+最后一阶段。
+
+`dsh-voco` `0.3.6` 起，每个完成的 frontend-agent 委派任务还会使用子 Session ID 提交
+`task-end` checkpoint。输入只包含 Voco 持有的用户原始请求（含已接受的补充要求）和最终可见结果，
+不包含 reasoning、工具日志、runtime context、workspace memory 注入或轮换 handoff。子 Session 继承
+主语音 Session 的 `cwd`，因此多个子 Session 与主会话自然进入同一个 workspace scope；任务 ID 派生的
+稳定消息 ID 与记忆引擎的 seen-message 机制共同保证重复终止事件幂等。取消、失败、等待用户继续的
+中间状态不作为稳定事实提交。服务不存在或调用失败时，Voco 保持原有行为。
 
 ## 6. 阶段性 checkpoint
 

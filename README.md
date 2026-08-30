@@ -24,7 +24,7 @@
 在 PowerShell 或终端中运行：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.13
+dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.14
 ```
 
 NPM 包地址：[@flowingspring/dsh-workspace-memory](https://www.npmjs.com/package/@flowingspring/dsh-workspace-memory)
@@ -34,10 +34,10 @@ NPM 包地址：[@flowingspring/dsh-workspace-memory](https://www.npmjs.com/pack
 直接安装 GitHub Release 中的预构建插件包：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.2.13/flowingspring-dsh-workspace-memory-0.2.13.tgz
+dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.2.14/flowingspring-dsh-workspace-memory-0.2.14.tgz
 ```
 
-Release 页面：[v0.2.13](https://github.com/lgquan/dsh-workspace-memory/releases/tag/v0.2.13)
+Release 页面：[v0.2.14](https://github.com/lgquan/dsh-workspace-memory/releases/tag/v0.2.14)
 
 ## 安装后怎么使用
 
@@ -65,13 +65,13 @@ dsh plugin --profile web list
 使用 NPM 更新到指定版本：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.13
+dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.14
 ```
 
 使用 GitHub 更新到指定标签：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.2.13/flowingspring-dsh-workspace-memory-0.2.13.tgz
+dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.2.14/flowingspring-dsh-workspace-memory-0.2.14.tgz
 ```
 
 更新后重启 `dsh web`。
@@ -136,7 +136,7 @@ $DSH_HOME/workspace-memory
 
 ## 与 dsh-voco 一起使用
 
-安装 [`dsh-voco`](https://github.com/lgquan/dsh-voco#readme) 后，语音 Session、普通 Session 和后台 Agent 只要使用相同的工作目录，就会共享同一个项目记忆范围。
+安装 [`dsh-voco`](https://github.com/lgquan/dsh-voco#readme) `0.3.6` 或更高版本后，语音主 Session、普通 Session 和语音委派子 Session 只要使用相同的工作目录，就会共享同一个项目记忆范围。每个完成的语音委派任务会以 `task-end` 触发整理；只提交用户原始请求和最终可见结果，不把 reasoning、工具日志或注入上下文保存为长期记忆。
 
 `dsh-voco` 不是必需依赖。未安装语音插件时，`dsh-workspace-memory` 仍可独立服务普通 DSH Agent。
 
@@ -187,8 +187,8 @@ $DSH_HOME/workspace-memory
 ## 更多文档
 
 - [设计与行为契约](./DESIGN.md)
-- [架构说明](./DOCS/ARCHITECTURE.md)
-- [问题与处理记录](./DOCS/issues/)
+- [架构说明](./docs/ARCHITECTURE.md)
+- [问题与处理记录](./docs/issues/)
 
 ## 开发
 

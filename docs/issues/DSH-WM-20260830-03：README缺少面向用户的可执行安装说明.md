@@ -27,7 +27,7 @@ README 同时承担了用户指南和架构说明，信息层级没有按下载�
 ## 解决方案
 
 - 将 README 重写为用户指南，优先说明定位、前提、NPM/GitHub 安装、重启验证、更新、卸载、整理触发、数据位置和常见问题。
-- 将内部存储与模块细节留在 `DESIGN.md` 和 `DOCS/ARCHITECTURE.md`，README 只保留必要行为说明和文档链接。
+- 将内部存储与模块细节留在 `DESIGN.md` 和 `docs/ARCHITECTURE.md`，README 只保留必要行为说明和文档链接。
 - NPM 使用 Registry 中的预构建包；GitHub 使用版本 Release 中的预构建 `.tgz` 附件。
 - 不从 Git 仓库运行 `prepare`：pnpm 11 会要求用户为具体 codeload URL 配置 `allowBuilds`，不适合作为公开安装流程。
 
