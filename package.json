@@ -50,7 +50,6 @@
   "scripts": {
     "build": "pnpm typecheck && tsc -p tsconfig.build.json && tsdown",
     "check": "pnpm typecheck && pnpm test",
-    "prepare": "pnpm build",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.client.json"
   },

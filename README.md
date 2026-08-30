@@ -17,7 +17,7 @@
 - 使用 DSH 的 `web` profile；
 - Node.js `>= 22.19.0`。
 
-下面两种方式任选一种。推荐使用 NPM，安装的是已经构建好的发布包；GitHub 安装适合希望直接跟随仓库版本的用户。
+下面两种方式任选一种。两种方式安装的都是已经构建好的插件包，不需要下载源码或准备开发环境。推荐使用 NPM；无法访问 NPM Registry 时可以改用 GitHub Release。
 
 ## 方式一：通过 NPM 安装（推荐）
 
@@ -31,13 +31,13 @@ NPM 包地址：[@flowingspring/dsh-workspace-memory](https://www.npmjs.com/pack
 
 ## 方式二：通过 GitHub 安装
 
-直接从 GitHub 的稳定标签安装，不需要下载项目或手动执行构建：
+直接安装 GitHub Release 中的预构建插件包：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 github:lgquan/dsh-workspace-memory#v0.2.12
+dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.2.12/flowingspring-dsh-workspace-memory-0.2.12.tgz
 ```
 
-GitHub 安装会在本机完成一次插件构建，因此通常比 NPM 安装稍慢。稳定使用请保留版本标签，不建议在生产环境直接安装 `#main`。
+Release 页面：[v0.2.12](https://github.com/lgquan/dsh-workspace-memory/releases/tag/v0.2.12)
 
 ## 安装后怎么使用
 
@@ -71,7 +71,7 @@ dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-wor
 使用 GitHub 更新到指定标签：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 github:lgquan/dsh-workspace-memory#v0.2.12
+dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.2.12/flowingspring-dsh-workspace-memory-0.2.12.tgz
 ```
 
 更新后重启 `dsh web`。
@@ -201,7 +201,7 @@ pnpm build
 pnpm pack --dry-run
 ```
 
-`lib/` 是构建产物，不提交到 Git；通过 NPM 安装时包含预构建产物，通过 GitHub 安装时由 `prepare` 脚本自动生成。
+`lib/` 是构建产物，不提交到 Git。NPM 包和 GitHub Release 附件都会包含经过发布检查的预构建产物。
 
 ## License
 
