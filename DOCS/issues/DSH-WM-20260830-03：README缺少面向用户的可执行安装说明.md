@@ -4,8 +4,8 @@
 - 发现日期：2026-08-30
 - 发现会话或复现方式：发布完成后复核 GitHub 与 NPM 项目首页
 - 相关模块或代码：`README.md`、`package.json`
-- 状态：处理中
-- 验证情况：待完成 GitHub 标签安装验证和远程推送
+- 状态：已解决
+- 验证情况：29 个测试、类型检查、生产构建和打包检查通过；GitHub Release 远程安装及核心模块导入通过；主分支和 `v0.2.12` 标签已推送
 
 ## 问题描述
 
@@ -28,11 +28,15 @@ README 同时承担了用户指南和架构说明，信息层级没有按下载�
 
 - 将 README 重写为用户指南，优先说明定位、前提、NPM/GitHub 安装、重启验证、更新、卸载、整理触发、数据位置和常见问题。
 - 将内部存储与模块细节留在 `DESIGN.md` 和 `DOCS/ARCHITECTURE.md`，README 只保留必要行为说明和文档链接。
-- 增加 `prepare` 脚本，使 pnpm/DSH 从 GitHub 安装时自动生成 `lib/`。
-- GitHub 安装固定使用版本标签，避免默认跟随可能变化的 `main`。
+- NPM 使用 Registry 中的预构建包；GitHub 使用版本 Release 中的预构建 `.tgz` 附件。
+- 不从 Git 仓库运行 `prepare`：pnpm 11 会要求用户为具体 codeload URL 配置 `allowBuilds`，不适合作为公开安装流程。
 
 ## 处理记录
 
 - 2026-08-30：确认 `dsh plugin add` 支持 Git host 依赖。
 - 2026-08-30：确认仓库不提交 `lib/`，GitHub 源码包不能作为预构建插件直接安装。
-- 2026-08-30：完成面向最终用户的 README 重写，并增加 Git 依赖安装构建脚本。
+- 2026-08-30：完成面向最终用户的 README 重写。
+- 2026-08-30：远程测试发现 GitHub Git 依赖的 `prepare` 被 pnpm 11 构建许可策略拦截，安装失败并提示 `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`。
+- 2026-08-30：将 GitHub 安装方式收敛为预构建 Release 附件，避免要求用户运行仓库构建脚本或修改 profile 的 `allowBuilds`。
+- 2026-08-30：创建 GitHub Release `v0.2.12`，上传 `flowingspring-dsh-workspace-memory-0.2.12.tgz`。
+- 2026-08-30：从公开 Release URL 在全新临时项目中安装成功；确认版本为 `0.2.12`，`lib/index.js`、`cordis.patch.yml` 均存在，`@flowingspring/dsh-workspace-memory/core` 可正常导入。
