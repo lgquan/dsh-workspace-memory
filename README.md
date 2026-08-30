@@ -29,7 +29,7 @@ Session 共享一份稳定摘要和长期原子记忆，并通过可选 Cordis �
 ## 安装（NPM）
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.11
+dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.12
 ```
 
 安装后重启 `dsh web`。也可以在 [NPM 页面](https://www.npmjs.com/package/@flowingspring/dsh-workspace-memory)

@@ -281,11 +281,15 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
   }
 
   const colors = {
-    text: 'var(--ds-color-text-primary, #f1f1f1)',
-    secondary: 'var(--ds-color-text-secondary, #a7a7ad)',
-    border: 'var(--ds-color-border, rgba(255,255,255,.12))',
-    surface: 'var(--ds-color-bg-secondary, rgba(255,255,255,.045))',
-    accent: 'var(--ds-color-primary, #8ab4ff)',
+    text: 'var(--dsw-alias-label-primary, #1f2328)',
+    secondary: 'var(--dsw-alias-label-secondary, #6b7280)',
+    tertiary: 'var(--dsw-alias-label-tertiary, #8b93a1)',
+    border: 'var(--dsw-alias-border-l2, #e5e7eb)',
+    surface: 'var(--dsw-alias-bg-layer-2, #f7f8fa)',
+    elevated: 'var(--dsw-alias-bg-layer-3, #ffffff)',
+    accent: 'var(--dsw-alias-brand-primary, #4f6ef7)',
+    warning: 'var(--dsw-alias-state-warn-primary, #b45309)',
+    danger: 'var(--dsw-alias-state-error-primary, #dc2626)',
   }
 
   return h('section', { style: { color: colors.text, maxWidth: 820, paddingBottom: 24 } },
@@ -306,11 +310,12 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
     h('div', { style: { display: 'grid', gap: 8, marginBottom: 18 } },
       h('label', { style: { color: colors.secondary, fontSize: 12 } }, t('scope')),
       h('select', {
-        value: displayedKey, onChange: (event: Event) => { const key = (event.target as unknown as { value: string }).value; if (view === 'active') onSelect(key); else onSelectArchived(key) },
-        style: { minHeight: 38, padding: '0 10px', color: colors.text, background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 6 },
+        value: displayedKey,
+        onChange: (event: Event) => { const key = (event.target as unknown as { value: string }).value; if (view === 'active') onSelect(key); else onSelectArchived(key) },
+        style: { boxSizing: 'border-box', minHeight: 38, width: '100%', padding: '0 10px', color: colors.text, background: colors.elevated, border: `1px solid ${colors.border}`, borderRadius: 8, colorScheme: 'light dark', font: 'inherit' },
       }, displayedOptions.length === 0
-        ? h('option', { value: '' }, view === 'active' ? t('emptyScopes') : t('archiveEmpty'))
-        : displayedOptions.map(scope => h('option', { key: scope.key, value: scope.key }, scope.kind === 'global' ? t('global') : workspaceName(scope.cwd, t('workspace')))),
+        ? h('option', { value: '', style: { color: colors.text, background: colors.elevated } }, view === 'active' ? t('emptyScopes') : t('archiveEmpty'))
+        : displayedOptions.map(scope => h('option', { key: scope.key, value: scope.key, style: { color: colors.text, background: colors.elevated } }, scope.kind === 'global' ? t('global') : workspaceName(scope.cwd, t('workspace')))),
       ),
     ),
     error && h('div', { role: 'alert', style: { padding: 12, border: `1px solid ${colors.border}`, borderRadius: 6, color: colors.secondary, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 } },
@@ -324,7 +329,7 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
         h('span', null, `${t('pending')}: ${displayedPayload?.state.pending ?? 0}`),
         h('span', null, `${t('checkpoints')}: ${displayedPayload?.state.checkpointCount ?? 0}`),
       ),
-      view === 'archived' && displayedPayload !== undefined && h('button', { type: 'button', onClick: () => { void purge() }, style: { justifySelf: 'start', color: '#ff8f8f', background: 'transparent', border: `1px solid ${colors.border}`, borderRadius: 6, padding: '7px 11px', cursor: 'pointer' } }, t('purge')),
+      view === 'archived' && displayedPayload !== undefined && h('button', { type: 'button', onClick: () => { void purge() }, style: { justifySelf: 'start', color: colors.danger, background: 'transparent', border: `1px solid ${colors.danger}`, borderRadius: 8, padding: '7px 11px', cursor: 'pointer' } }, t('purge')),
       h('article', { style: { border: `1px solid ${colors.border}`, borderRadius: 6, padding: 14, background: colors.surface } },
         h('h3', { style: { margin: '0 0 10px', fontSize: 14 } }, t('summary')),
         h('pre', { style: { margin: 0, color: colors.secondary, whiteSpace: 'pre-wrap', wordBreak: 'break-word', font: 'inherit', lineHeight: 1.55 } }, displayedPayload?.summary.trim() || t('noSummary')),
@@ -338,8 +343,8 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
         filteredEntries.map(entry => h('details', { key: entry.id, style: { border: `1px solid ${colors.border}`, borderRadius: 6, padding: '10px 12px', background: colors.surface } },
           h('summary', { style: { cursor: 'pointer', display: 'flex', gap: 8, alignItems: 'baseline' } },
             h('strong', { style: { fontSize: 13 } }, entry.title),
-            h('span', { style: { color: colors.secondary, fontSize: 11 } }, entry.type),
-            h('span', { style: { color: entry.status === 'conflict' ? '#f4c96b' : entry.status === 'superseded' ? colors.secondary : colors.accent, fontSize: 11 } }, t(entry.status)),
+            h('span', { style: { color: colors.tertiary, fontSize: 11 } }, entry.type),
+            h('span', { style: { color: entry.status === 'conflict' ? colors.warning : entry.status === 'superseded' ? colors.tertiary : colors.accent, fontSize: 11 } }, t(entry.status)),
           ),
           h('p', { style: { margin: '10px 0 0', color: colors.secondary, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } }, entry.content),
           entry.tags.length > 0 && h('div', { style: { marginTop: 10, color: colors.accent, fontSize: 11 } }, entry.tags.join(' · ')),
