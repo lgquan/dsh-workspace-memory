@@ -103,13 +103,17 @@ following is true:
 Only completed messages enter the buffer. Checkpointing is asynchronous from
 Agent/voice response delivery. A scope queue prevents concurrent mutations.
 
-The distiller outputs durable atomic facts only: preferences, project facts,
-decisions, conventions, fixes, and explicitly requested memories. Greetings,
-temporary instructions, progress chatter, and unconfirmed speculation are
-discarded. Similar existing entries are updated instead of duplicated.
+The distiller receives a bounded set of relevant existing entries and emits
+versioned operations: add, revise, supersede, or flag-conflict. Explicit user
+corrections may supersede an older fact only when verbatim user and target
+quotes validate against the checkpoint and current target. Uncertain conflicts
+remain visible as a conflict group instead of silently disabling either fact.
+Revisions and superseded entries remain auditable, while only active facts enter
+the stable summary. Legacy proposal arrays remain compatible as add operations.
 
-After `consolidateEvery` successful checkpoints (default 5), the summary is
-rebuilt from active entries. A bounded history is kept before replacement.
+Any memory mutation immediately rebuilds the affected scope summary so corrected
+facts cannot remain injected. `consolidateEvery` successful checkpoints (default
+5) provides a periodic fallback rebuild. A bounded history is kept before replacement.
 
 ## DSH integration
 

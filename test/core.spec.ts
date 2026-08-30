@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { onTestFinished, test } from 'vitest'
@@ -19,12 +19,14 @@ import {
 
 function sequenceUuid() {
   let value = 0
-  return () => `00000000-0000-0000-0000-${String(++value).padStart(12, '0')}`
+  return () => `${String(++value).padStart(8, '0')}-0000-0000-0000-000000000000`
 }
 
 interface FixtureOptions {
   config?: Partial<MemoryEngineConfig>
   proposals?: readonly MemoryProposal[]
+  distilled?: unknown
+  distill?: (input: DistillInput) => unknown
 }
 
 async function fixture(options: FixtureOptions = {}) {
@@ -45,7 +47,7 @@ async function fixture(options: FixtureOptions = {}) {
     },
     distill: async input => {
       calls.push(input)
-      return options.proposals ?? [{ content: '项目的语音前台聊天绕过 Agent Loop。', tags: ['project', 'voice'], importance: 2 }]
+      return options.distill?.(input) ?? options.distilled ?? options.proposals ?? [{ content: '项目的语音前台聊天绕过 Agent Loop。', tags: ['project', 'voice'], importance: 2 }]
     },
   })
   return {
@@ -333,6 +335,41 @@ test('supports legacy entries without metadata', async () => {
   assert.equal(entries[0]?.title, '旧版记忆内容。')
 })
 
+test('accepts the legacy distiller memories object as add operations', async () => {
+  const f = await fixture({ distilled: { memories: [{ content: '旧版蒸馏输出仍可写入。' }] } })
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'legacy-distill')
+  const result = await f.engine.checkpoint({
+    cwd,
+    reason: 'task-end',
+    force: true,
+    messages: [{ id: 'u1', role: 'user', text: '保存一条兼容记忆。' }],
+  })
+  assert.equal(result.added, 1)
+  assert.equal((await f.store.readEntries(f.store.scope(cwd)))[0]?.content, '旧版蒸馏输出仍可写入。')
+})
+
+test('retains pending messages when the operation contract is invalid and retries later', async () => {
+  let fail = true
+  const f = await fixture({
+    distill: () => fail ? { version: 2, operations: [] } : [{ content: '重试后保存的事实。' }],
+  })
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'failed-distill')
+  const first = await f.engine.checkpoint({
+    cwd,
+    reason: 'task-end',
+    force: true,
+    messages: [{ id: 'u1', role: 'user', text: '这次蒸馏契约无效。' }],
+  })
+  assert.equal(first.status, 'failed')
+  assert.equal((await f.store.readState(f.store.scope(cwd))).pendingMessages.length, 1)
+  fail = false
+  const retried = await f.engine.checkpoint({ cwd, reason: 'explicit', force: true, messages: [] })
+  assert.equal(retried.status, 'committed')
+  assert.equal((await f.store.readState(f.store.scope(cwd))).pendingMessages.length, 0)
+})
+
 test('budgets matches after truncating the combined summaries', async () => {
   const f = await fixture({ config: { summaryMaxBytes: 1000 } })
   onTestFinished(f.cleanup)
@@ -345,4 +382,270 @@ test('budgets matches after truncating the combined summaries', async () => {
   const context = await f.engine.recall({ cwd, query: '预算测试目标 TypeScript', maxBytes: 1500 })
   assert.equal(context.summary.length > 0, true)
   assert.equal(context.matches[0]?.title, '预算测试目标')
+})
+
+test('revises a near-duplicate with shorter content and retains the previous version', async () => {
+  const f = await fixture()
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace-revision')
+  await f.engine.remember({ cwd, content: '项目使用 PostgreSQL 数据库。' })
+  const result = await f.engine.remember({ cwd, content: '项目使用 PostgreSQL。' })
+  assert.equal(result.updated, 1)
+  const entries = await f.store.readEntries(f.store.scope(cwd))
+  assert.equal(entries[0]?.content, '项目使用 PostgreSQL。')
+  assert.equal(entries[0]?.revisions?.[0]?.content, '项目使用 PostgreSQL 数据库。')
+})
+
+test('supersedes an explicitly corrected memory and immediately removes it from recall and summary', async () => {
+  const f = await fixture({
+    config: { consolidateEvery: 5 },
+    distill: input => {
+      const target = input.existingEntries?.find(entry => entry.content.includes('MySQL'))
+      return {
+        version: 1,
+        operations: [{
+          op: 'supersede',
+          targetId: target?.id,
+          targetScope: 'workspace',
+          scope: 'workspace',
+          content: '项目数据库使用 PostgreSQL。',
+          evidenceMessageIds: ['u-correction'],
+          newQuote: '项目实际使用 PostgreSQL',
+          oldQuote: 'MySQL',
+        }],
+      }
+    },
+  })
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace-correction')
+  await f.engine.remember({ cwd, content: '项目数据库使用 MySQL。' })
+  const result = await f.engine.checkpoint({
+    cwd,
+    reason: 'task-end',
+    force: true,
+    messages: [{ id: 'u-correction', role: 'user', text: '前面说错了，项目实际使用 PostgreSQL。' }],
+  })
+  assert.equal(result.superseded, 1)
+  const scope = f.store.scope(cwd)
+  const entries = await f.store.readEntries(scope)
+  assert.equal(entries.find(entry => entry.content.includes('MySQL'))?.status, 'superseded')
+  assert.equal(entries.find(entry => entry.content.includes('PostgreSQL'))?.status, 'active')
+  assert.doesNotMatch(await f.store.readSummary(scope), /MySQL/u)
+  assert.match(await f.store.readSummary(scope), /PostgreSQL/u)
+  assert.equal((await f.engine.recall({ cwd, query: 'MySQL 数据库' })).matches.some(match => match.content.includes('MySQL')), false)
+})
+
+test('rejects supersede without verbatim user evidence and audits the rejection', async () => {
+  const f = await fixture({
+    distill: input => ({
+      version: 1,
+      operations: [{
+        op: 'supersede',
+        targetId: input.existingEntries?.find(entry => entry.content.includes('MySQL'))?.id,
+        content: '项目数据库使用 PostgreSQL。',
+        evidenceMessageIds: ['a1'],
+        newQuote: 'PostgreSQL',
+        oldQuote: 'MySQL',
+      }],
+    }),
+  })
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace-rejected')
+  await f.engine.remember({ cwd, content: '项目数据库使用 MySQL。' })
+  const result = await f.engine.checkpoint({
+    cwd,
+    reason: 'task-end',
+    force: true,
+    messages: [{ id: 'a1', role: 'assistant', text: '项目数据库使用 PostgreSQL。' }],
+  })
+  assert.equal(result.ignored, 1)
+  const scope = f.store.scope(cwd)
+  assert.equal((await f.store.readEntries(scope)).find(entry => entry.content.includes('MySQL'))?.status, 'active')
+  const checkpoint = (await readdir(join(scope.dir, 'checkpoints')))[0]
+  assert.ok(checkpoint)
+  const markdown = await readFile(join(scope.dir, 'checkpoints', checkpoint), 'utf8')
+  assert.match(markdown, /rejected: supersede/u)
+  assert.match(markdown, /user evidence/u)
+})
+
+test('keeps uncertain corrections as an explicit conflict and excludes the group from summary', async () => {
+  const f = await fixture({
+    distill: input => ({
+      version: 1,
+      operations: [{
+        op: 'flag-conflict',
+        targetId: input.existingEntries?.find(entry => entry.content.includes('MySQL'))?.id,
+        content: '项目数据库可能使用 PostgreSQL。',
+        tags: ['database'],
+      }],
+    }),
+  })
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace-conflict')
+  await f.engine.remember({ cwd, content: '项目数据库使用 MySQL。', tags: ['database'] })
+  const result = await f.engine.checkpoint({
+    cwd,
+    reason: 'task-end',
+    force: true,
+    messages: [{ id: 'a1', role: 'assistant', text: '代码看起来可能使用 PostgreSQL。' }],
+  })
+  assert.equal(result.conflicts, 1)
+  const scope = f.store.scope(cwd)
+  const entries = await f.store.readEntries(scope)
+  assert.equal(entries.filter(entry => entry.status === 'conflict').length, 2)
+  assert.equal(new Set(entries.map(entry => entry.conflictGroupId).filter(Boolean)).size, 1)
+  assert.doesNotMatch(await f.store.readSummary(scope), /MySQL|PostgreSQL/u)
+  const matches = (await f.engine.recall({ cwd, query: '项目数据库' })).matches
+  assert.equal(matches.length, 2)
+  assert.ok(matches.every(match => match.status === 'conflict' && match.conflictWith?.length === 1))
+})
+
+test('an explicit correction supersedes only the named member of a conflict group', async () => {
+  const f = await fixture({
+    distill: input => {
+      const target = input.existingEntries?.find(entry => entry.content.includes('MySQL'))
+      const resolving = input.messages.some(message => message.id === 'u-resolve')
+      return resolving
+        ? {
+            version: 1,
+            operations: [{
+              op: 'supersede',
+              targetId: target?.id,
+              content: '项目数据库使用 SQLite。',
+              evidenceMessageIds: ['u-resolve'],
+              newQuote: '实际使用 SQLite',
+              oldQuote: 'MySQL',
+            }],
+          }
+        : { version: 1, operations: [{ op: 'flag-conflict', targetId: target?.id, content: '项目数据库可能使用 PostgreSQL。' }] }
+    },
+  })
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace-resolve-conflict')
+  await f.engine.remember({ cwd, content: '项目数据库使用 MySQL。' })
+  await f.engine.checkpoint({
+    cwd,
+    reason: 'task-end',
+    force: true,
+    messages: [{ id: 'a-conflict', role: 'assistant', text: '项目数据库可能使用 PostgreSQL。' }],
+  })
+  const result = await f.engine.checkpoint({
+    cwd,
+    reason: 'task-end',
+    force: true,
+    messages: [{ id: 'u-resolve', role: 'user', text: 'MySQL 这个说法不对，项目实际使用 SQLite。' }],
+  })
+  assert.equal(result.superseded, 1)
+  const entries = await f.store.readEntries(f.store.scope(cwd))
+  assert.equal(entries.filter(entry => entry.status === 'superseded').length, 1)
+  assert.equal(entries.filter(entry => entry.status === 'conflict').length, 1)
+  const active = entries.filter(entry => entry.status === 'active')
+  assert.equal(active.length, 1)
+  assert.match(active[0]?.content ?? '', /SQLite/u)
+  assert.equal(active[0]?.supersedes?.length, 1)
+})
+
+test('routes a workspace correction to global memory and rebuilds the global summary', async () => {
+  const f = await fixture({
+    distill: input => ({
+      version: 1,
+      operations: [{
+        op: 'supersede',
+        targetId: input.existingEntries?.find(entry => entry.scope === 'global' && entry.content.includes('创建文件'))?.id,
+        targetScope: 'global',
+        scope: 'global',
+        content: '联网搜索时不要创建文件。',
+        evidenceMessageIds: ['u-global'],
+        newQuote: '联网搜索时不要创建文件',
+        oldQuote: '创建文件',
+      }],
+    }),
+  })
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace-global-correction')
+  await f.engine.remember({ scope: 'global', content: '联网搜索时需要创建文件。' })
+  const result = await f.engine.checkpoint({
+    cwd,
+    reason: 'task-end',
+    force: true,
+    messages: [{ id: 'u-global', role: 'user', text: '更正：联网搜索时不要创建文件。' }],
+  })
+  assert.equal(result.superseded, 1)
+  assert.ok(f.calls[0]?.existingEntries?.some(entry => entry.scope === 'global'))
+  const global = f.store.scope('')
+  const entries = await f.store.readEntries(global)
+  assert.equal(entries.find(entry => entry.content.includes('需要创建'))?.status, 'superseded')
+  assert.match(await f.store.readSummary(global), /不要创建文件/u)
+  assert.doesNotMatch(await f.store.readSummary(global), /需要创建文件/u)
+})
+
+test('downgrades a correction against a branched supersede chain into one conflict group', async () => {
+  const f = await fixture({
+    distilled: {
+      version: 1,
+      operations: [{ op: 'supersede', targetId: 'old', content: '项目数据库使用 SQLite。' }],
+    },
+  })
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace-branch')
+  const scope = f.store.scope(cwd)
+  await f.store.ensure(scope)
+  await f.store.writeEntries(scope, [
+    { id: 'old', content: '项目数据库使用 MySQL。', status: 'superseded', supersededBy: ['branch-a', 'branch-b'] },
+    { id: 'branch-a', content: '项目数据库使用 PostgreSQL。', status: 'active' },
+    { id: 'branch-b', content: '项目数据库使用 MariaDB。', status: 'active' },
+  ])
+  const result = await f.engine.checkpoint({
+    cwd,
+    reason: 'task-end',
+    force: true,
+    messages: [{ id: 'u1', role: 'user', text: '项目数据库使用 SQLite。' }],
+  })
+  assert.equal(result.conflicts, 1)
+  const entries = await f.store.readEntries(scope)
+  const conflicts = entries.filter(entry => entry.status === 'conflict')
+  assert.equal(conflicts.length, 3)
+  assert.equal(new Set(conflicts.map(entry => entry.conflictGroupId)).size, 1)
+  assert.equal(entries.find(entry => entry.id === 'old')?.status, 'superseded')
+})
+
+test('redirects a second correction through a unique supersede chain head', async () => {
+  let originalId = ''
+  const f = await fixture({
+    distill: input => {
+      const second = input.messages.some(message => message.id === 'u-second')
+      return {
+        version: 1,
+        operations: [{
+          op: 'supersede',
+          targetId: second ? originalId : input.existingEntries?.find(entry => entry.content.includes('MySQL'))?.id,
+          content: second ? '项目数据库使用 SQLite。' : '项目数据库使用 PostgreSQL。',
+          evidenceMessageIds: [second ? 'u-second' : 'u-first'],
+          newQuote: second ? '实际使用 SQLite' : '实际使用 PostgreSQL',
+          oldQuote: second ? 'PostgreSQL' : 'MySQL',
+        }],
+      }
+    },
+  })
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace-chain')
+  await f.engine.remember({ cwd, content: '项目数据库使用 MySQL。' })
+  originalId = (await f.store.readEntries(f.store.scope(cwd)))[0]?.id ?? ''
+  await f.engine.checkpoint({
+    cwd,
+    reason: 'task-end',
+    force: true,
+    messages: [{ id: 'u-first', role: 'user', text: '更正，项目实际使用 PostgreSQL。' }],
+  })
+  const second = await f.engine.checkpoint({
+    cwd,
+    reason: 'task-end',
+    force: true,
+    messages: [{ id: 'u-second', role: 'user', text: '再次更正，项目实际使用 SQLite。' }],
+  })
+  assert.equal(second.superseded, 1)
+  const entries = await f.store.readEntries(f.store.scope(cwd))
+  assert.equal(entries.find(entry => entry.content.includes('PostgreSQL'))?.status, 'superseded')
+  assert.equal(entries.find(entry => entry.content.includes('SQLite'))?.status, 'active')
+  assert.deepEqual(entries.find(entry => entry.id === originalId)?.supersededBy?.length, 1)
 })

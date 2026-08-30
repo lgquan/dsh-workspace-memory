@@ -31,6 +31,11 @@ const zh = {
   updated: '最近更新',
   all: '全部',
   count: '条',
+  active: '有效',
+  conflict: '存在冲突',
+  superseded: '已被取代',
+  deleted: '已删除',
+  revisions: '历史版本',
 }
 
 const en = {
@@ -60,6 +65,11 @@ const en = {
   updated: 'Last updated',
   all: 'All',
   count: '',
+  active: 'Active',
+  conflict: 'Conflict',
+  superseded: 'Superseded',
+  deleted: 'Deleted',
+  revisions: 'Previous revisions',
 }
 
 type Translate = (key: keyof typeof zh) => string
@@ -86,6 +96,11 @@ interface MemoryEntry {
   importance: number
   createdAt?: string
   updatedAt?: string
+  status: 'active' | 'conflict' | 'superseded' | 'deleted'
+  conflictGroupId?: string
+  supersedes?: string[]
+  supersededBy?: string[]
+  revisions?: Array<{ content: string; title: string; description: string; at: string }>
 }
 
 interface ScopePayload {
@@ -324,9 +339,14 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
           h('summary', { style: { cursor: 'pointer', display: 'flex', gap: 8, alignItems: 'baseline' } },
             h('strong', { style: { fontSize: 13 } }, entry.title),
             h('span', { style: { color: colors.secondary, fontSize: 11 } }, entry.type),
+            h('span', { style: { color: entry.status === 'conflict' ? '#f4c96b' : entry.status === 'superseded' ? colors.secondary : colors.accent, fontSize: 11 } }, t(entry.status)),
           ),
           h('p', { style: { margin: '10px 0 0', color: colors.secondary, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } }, entry.content),
           entry.tags.length > 0 && h('div', { style: { marginTop: 10, color: colors.accent, fontSize: 11 } }, entry.tags.join(' · ')),
+          (entry.revisions?.length ?? 0) > 0 && h('details', { style: { marginTop: 10, color: colors.secondary, fontSize: 11 } },
+            h('summary', { style: { cursor: 'pointer' } }, `${t('revisions')} (${entry.revisions?.length ?? 0})`),
+            entry.revisions?.map(revision => h('p', { key: `${revision.at}:${revision.content}`, style: { margin: '6px 0 0', whiteSpace: 'pre-wrap' } }, revision.content)),
+          ),
           entry.updatedAt !== undefined && h('div', { style: { marginTop: 8, color: colors.secondary, fontSize: 11 } }, `${t('updated')}: ${formatDate(entry.updatedAt)}`),
         )),
       ),

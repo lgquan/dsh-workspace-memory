@@ -17,7 +17,7 @@ class MemoryAdapter extends LlmAdapter {
     yield {
       type: 'text-delta',
       index: 0,
-      text: '{"memories":[{"content":"Voco 前台通过可选 workspaceMemory 接口读取长期记忆。","tags":["voice","architecture"],"importance":3}]}',
+      text: '{"version":1,"operations":[{"op":"add","content":"Voco 前台通过可选 workspaceMemory 接口读取长期记忆。","tags":["voice","architecture"],"importance":3}]}',
     }
     yield { type: 'finish', reason: { kind: 'stop' } }
   }

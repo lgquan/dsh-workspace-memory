@@ -10,6 +10,15 @@ export interface MemoryMessage {
   text: string
 }
 
+export type MemoryStatus = 'active' | 'conflict' | 'superseded' | 'deleted'
+
+export interface MemoryRevision {
+  content: string
+  title: string
+  description: string
+  at: string
+}
+
 export interface MemoryEntry {
   id: string
   scope?: 'global' | 'workspace'
@@ -20,7 +29,15 @@ export interface MemoryEntry {
   content: string
   tags?: string[]
   importance?: number
-  status?: 'active' | 'deleted'
+  status?: MemoryStatus
+  conflictGroupId?: string
+  supersedes?: string[]
+  supersededBy?: string[]
+  revisions?: MemoryRevision[]
+  provenance?: {
+    messageIds: string[]
+    reason: 'explicit-correction' | 'revision' | 'manual'
+  }
   createdAt?: string
   updatedAt?: string
 }
@@ -57,6 +74,8 @@ export interface MemoryMatch {
   tags: string[]
   importance: number
   score: number
+  status?: MemoryStatus
+  conflictWith?: string[]
 }
 
 export interface MemoryContext {
@@ -148,18 +167,46 @@ export interface MutationResult {
   added: number
   updated: number
   ignored: number
+  superseded?: number
+  conflicts?: number
 }
 
 export interface DistillInput {
   scope: WorkspaceScope
   messages: readonly MemoryMessage[]
   reason: CheckpointReason
+  existingEntries?: readonly MemoryEntry[]
+}
+
+export interface MemoryOperation extends MemoryProposal {
+  op?: 'add' | 'revise' | 'supersede' | 'flag-conflict'
+  targetId?: string
+  targetScope?: 'global' | 'workspace'
+  oldQuote?: string
+  newQuote?: string
+  evidenceMessageIds?: readonly string[]
+}
+
+export interface DistillOutput {
+  version: 1
+  operations: readonly MemoryOperation[]
 }
 
 export interface WorkspaceMemoryEngineOptions {
   store: WorkspaceMemoryStore
-  distill(input: DistillInput): Promise<readonly unknown[]>
+  distill(input: DistillInput): Promise<unknown>
   config?: Partial<MemoryEngineConfig>
+}
+
+interface OperationAudit {
+  op: string
+  targetId?: string
+  status: 'accepted' | 'rejected'
+  reason: string
+}
+
+interface AppliedOperations extends MutationResult {
+  audit: OperationAudit[]
 }
 
 export const SUMMARY_FILE = 'memory_summary.md'
@@ -241,6 +288,18 @@ export function lexicalTokens(value: unknown): string[] {
   return [...new Set([...ascii, ...unicodeWords, ...cjkBigrams(normalized)].filter(token => token.length > 0))]
 }
 
+export function isRecallable(entry: MemoryEntry): boolean {
+  return entry.status === undefined || entry.status === 'active' || entry.status === 'conflict'
+}
+
+export function isSummarizable(entry: MemoryEntry): boolean {
+  return entry.status === undefined || entry.status === 'active'
+}
+
+export function isDedupCandidate(entry: MemoryEntry): boolean {
+  return isRecallable(entry)
+}
+
 function daysSince(iso: string | undefined, now: number): number {
   if (iso === undefined) return 365
   const time = Date.parse(iso)
@@ -261,7 +320,7 @@ export function searchEntries(
   const surfaced = new Set(options.surfacedMemoryIds ?? [])
   const ranked: Array<{ entry: MemoryEntry; score: number; matchedTokens: number }> = []
   for (const entry of entries) {
-    if (entry.status === 'deleted') continue
+    if (!isRecallable(entry)) continue
     const haystack = normalizeMemoryText([
       entry.content,
       entry.title,
@@ -336,6 +395,20 @@ function validEntry(value: unknown): value is MemoryEntry {
 }
 
 function migrateEntry(entry: MemoryEntry, scope: 'global' | 'workspace'): MemoryEntry {
+  const allowedStatuses = new Set<MemoryStatus>(['active', 'conflict', 'superseded', 'deleted'])
+  const revisions = safeArray(entry.revisions).filter((revision): revision is MemoryRevision => isRecord(revision)
+    && typeof revision.content === 'string'
+    && typeof revision.title === 'string'
+    && typeof revision.description === 'string'
+    && typeof revision.at === 'string')
+  const supersedes = safeArray(entry.supersedes).filter((id): id is string => typeof id === 'string')
+  const supersededBy = safeArray(entry.supersededBy).filter((id): id is string => typeof id === 'string')
+  const provenance = isRecord(entry.provenance)
+    && Array.isArray(entry.provenance.messageIds)
+    && entry.provenance.messageIds.every(id => typeof id === 'string')
+    && (entry.provenance.reason === 'explicit-correction' || entry.provenance.reason === 'revision' || entry.provenance.reason === 'manual')
+    ? { messageIds: [...entry.provenance.messageIds], reason: entry.provenance.reason }
+    : undefined
   return {
     ...entry,
     scope: entry.scope ?? scope,
@@ -345,7 +418,11 @@ function migrateEntry(entry: MemoryEntry, scope: 'global' | 'workspace'): Memory
     retrievalTerms: entry.retrievalTerms ?? [],
     tags: entry.tags ?? [],
     importance: entry.importance ?? 1,
-    status: entry.status ?? 'active',
+    status: entry.status !== undefined && allowedStatuses.has(entry.status) ? entry.status : 'active',
+    ...(revisions.length === 0 ? {} : { revisions }),
+    ...(supersedes.length === 0 ? {} : { supersedes }),
+    ...(supersededBy.length === 0 ? {} : { supersededBy }),
+    ...(provenance === undefined ? {} : { provenance }),
   }
 }
 
@@ -366,7 +443,7 @@ function archivedScopeDirectory(root: string, key: string): string {
 
 function deterministicSummary(entries: readonly MemoryEntry[], maxBytes: number, heading = '# 项目记忆'): string {
   const active = entries
-    .filter(entry => entry.status !== 'deleted')
+    .filter(isSummarizable)
     .sort((left, right) => Number(right.importance ?? 1) - Number(left.importance ?? 1)
       || String(right.updatedAt).localeCompare(String(left.updatedAt)))
   const lines = [heading, '', '由 dsh-workspace-memory 维护的长期事实。', '']
@@ -382,12 +459,14 @@ function deterministicSummary(entries: readonly MemoryEntry[], maxBytes: number,
 function checkpointMarkdown(
   reason: CheckpointReason,
   messages: readonly MemoryMessage[],
-  proposals: readonly unknown[],
+  operations: readonly MemoryOperation[],
   result: MutationResult,
+  audit: readonly OperationAudit[],
   at: string,
 ): string {
   const messageText = messages.map(message => `- **${message.role}**: ${message.text}`).join('\n')
-  const proposalText = proposals.map(proposal => `- ${normalizeProposal(proposal)?.content ?? '(ignored invalid proposal)'}`).join('\n') || '- (none)'
+  const proposalText = operations.map(operation => `- ${operation.op ?? 'add'}: ${normalizeProposal(operation)?.content ?? '(invalid operation)'}`).join('\n') || '- (none)'
+  const auditText = audit.map(item => `- ${item.status}: ${item.op}${item.targetId === undefined ? '' : ` ${item.targetId}`} (${item.reason})`).join('\n') || '- (none)'
   return [
     `# Memory checkpoint ${at}`,
     '',
@@ -401,7 +480,11 @@ function checkpointMarkdown(
     '',
     proposalText,
     '',
-    `Result: added=${result.added}, updated=${result.updated}, ignored=${result.ignored}`,
+    '## Operation audit',
+    '',
+    auditText,
+    '',
+    `Result: added=${result.added}, updated=${result.updated}, superseded=${result.superseded ?? 0}, conflicts=${result.conflicts ?? 0}, ignored=${result.ignored}`,
     '',
   ].join('\n')
 }
@@ -627,12 +710,13 @@ export class WorkspaceMemoryStore {
     scope: WorkspaceScope,
     reason: CheckpointReason,
     messages: readonly MemoryMessage[],
-    proposals: readonly unknown[],
+    operations: readonly MemoryOperation[],
     result: MutationResult,
+    audit: readonly OperationAudit[],
   ): Promise<void> {
     const at = new Date(this.now()).toISOString().replaceAll(':', '-')
     const file = join(scope.dir, CHECKPOINT_DIR, `${at}.${this.uuid()}.md`)
-    await this.writeAtomic(file, checkpointMarkdown(reason, messages, proposals, result, at))
+    await this.writeAtomic(file, checkpointMarkdown(reason, messages, operations, result, audit, at))
   }
 
   async writeAtomic(file: string, text: string): Promise<void> {
@@ -657,6 +741,10 @@ function cloneSnapshot(snapshot: MemoryScopeSnapshot): MemoryScopeSnapshot {
       ...entry,
       ...(entry.retrievalTerms === undefined ? {} : { retrievalTerms: [...entry.retrievalTerms] }),
       ...(entry.tags === undefined ? {} : { tags: [...entry.tags] }),
+      ...(entry.supersedes === undefined ? {} : { supersedes: [...entry.supersedes] }),
+      ...(entry.supersededBy === undefined ? {} : { supersededBy: [...entry.supersededBy] }),
+      ...(entry.revisions === undefined ? {} : { revisions: entry.revisions.map(revision => ({ ...revision })) }),
+      ...(entry.provenance === undefined ? {} : { provenance: { ...entry.provenance, messageIds: [...entry.provenance.messageIds] } }),
     })),
     state: {
       ...snapshot.state,
@@ -698,27 +786,258 @@ function normalizeProposal(value: unknown): NormalizedMemoryProposal | undefined
   }
 }
 
-function applyProposals(
+function normalizeOperations(value: unknown): MemoryOperation[] {
+  if (Array.isArray(value)) return value.map(item => (isRecord(item) ? { ...item, op: 'add' as const } : { op: 'invalid' }) as unknown as MemoryOperation)
+  if (!isRecord(value)) throw new Error('memory distiller returned an invalid operation contract')
+  if (value.version === 1 && Array.isArray(value.operations)) return safeArray(value.operations).map(item => (isRecord(item) ? item : { op: 'invalid' }) as unknown as MemoryOperation)
+  if (Array.isArray(value.memories)) return safeArray(value.memories).map(item => (isRecord(item) ? { ...item, op: 'add' as const } : { op: 'invalid' }) as unknown as MemoryOperation)
+  throw new Error('memory distiller returned an unsupported operation contract')
+}
+
+function operationScope(operation: MemoryOperation): 'global' | 'workspace' {
+  if (operation.targetScope === 'global') return 'global'
+  if (operation.targetScope === 'workspace') return 'workspace'
+  return operation.scope === 'global' ? 'global' : 'workspace'
+}
+
+function uniqueId(uuid: () => string): string {
+  return `mem-${uuid().replaceAll('-', '').slice(0, 12)}`
+}
+
+function messageById(messages: readonly MemoryMessage[], id: string): MemoryMessage | undefined {
+  return messages.find(message => message.id === id)
+}
+
+function evidenceValid(
+  operation: MemoryOperation,
+  target: MemoryEntry,
+  messages: readonly MemoryMessage[],
+): boolean {
+  if (operation.newQuote === undefined || operation.newQuote.trim() === '') return false
+  if (operation.oldQuote === undefined || operation.oldQuote.trim() === '') return false
+  const ids = operation.evidenceMessageIds ?? []
+  if (ids.length === 0) return false
+  const userMessages = ids.map(id => messageById(messages, id)).filter((message): message is MemoryMessage => message?.role === 'user')
+  if (userMessages.length === 0) return false
+  if (!userMessages.some(message => message.text.includes(operation.newQuote ?? ''))) return false
+  if (!target.content.includes(operation.oldQuote)) return false
+  return true
+}
+
+interface TargetResolution {
+  target?: MemoryEntry
+  branches?: MemoryEntry[]
+}
+
+function resolveTarget(entries: readonly MemoryEntry[], targetId: string): TargetResolution {
+  let current = entries.find(entry => entry.id === targetId)
+  const seen = new Set<string>()
+  while (current?.status === 'superseded' && current.supersededBy !== undefined && !seen.has(current.id)) {
+    seen.add(current.id)
+    const successorIds = current.supersededBy
+    if (successorIds.length !== 1) {
+      const branches = successorIds.map(id => entries.find(entry => entry.id === id)).filter((entry): entry is MemoryEntry => entry !== undefined)
+      return branches.length > 1 ? { branches } : {}
+    }
+    current = entries.find(entry => entry.id === successorIds[0])
+  }
+  if (current?.status === 'superseded') return {}
+  return current === undefined ? {} : { target: current }
+}
+
+function createConflict(
   entries: MemoryEntry[],
-  proposals: readonly unknown[],
+  targets: readonly MemoryEntry[],
+  normalized: NormalizedMemoryProposal,
   nowIso: string,
   uuid: () => string,
-): MutationResult {
+): { id: string; group: string } {
+  const existingGroups = new Set(targets.map(target => target.conflictGroupId).filter((group): group is string => group !== undefined))
+  const group = existingGroups.values().next().value ?? `conflict-${uuid().replaceAll('-', '').slice(0, 12)}`
+  for (const entry of entries) {
+    if (!isRecallable(entry)) continue
+    if (targets.some(target => target.id === entry.id) || (entry.conflictGroupId !== undefined && existingGroups.has(entry.conflictGroupId))) {
+      entry.status = 'conflict'
+      entry.conflictGroupId = group
+      entry.updatedAt = nowIso
+    }
+  }
+  const id = uniqueId(uuid)
+  entries.push({
+    id,
+    scope: normalized.scope,
+    type: normalized.type,
+    title: normalized.title,
+    description: normalized.description,
+    retrievalTerms: normalized.retrievalTerms,
+    content: normalized.content,
+    tags: normalized.tags,
+    importance: normalized.importance,
+    status: 'conflict',
+    conflictGroupId: group,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  })
+  return { id, group }
+}
+
+function appendRevision(entry: MemoryEntry, nowIso: string): void {
+  const revisions = entry.revisions ?? []
+  revisions.push({
+    content: entry.content,
+    title: entry.title ?? entry.content.slice(0, 80),
+    description: entry.description ?? entry.content.slice(0, 240),
+    at: entry.updatedAt ?? nowIso,
+  })
+  entry.revisions = revisions.slice(-20)
+}
+
+export function selectDistillationCandidates(
+  entries: readonly MemoryEntry[],
+  messages: readonly MemoryMessage[],
+  maxEntries = 20,
+  maxBytes = 12_000,
+): MemoryEntry[] {
+  const query = messages.map(message => message.text).join('\n')
+  const queryTokens = new Set(lexicalTokens(query))
+  const lexical = searchEntries(entries, query, { limit: Math.min(12, maxEntries) }).map(result => result.entry)
+  const sameTopic = entries.filter(entry => isRecallable(entry) && [entry.type, ...(entry.tags ?? [])]
+    .flatMap(value => lexicalTokens(value))
+    .some(token => queryTokens.has(token)))
+  const recent = entries.filter(isRecallable).sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt))).slice(0, 8)
+  const selected: MemoryEntry[] = []
+  let bytes = 0
+  for (const entry of [...lexical, ...sameTopic, ...recent]) {
+    if (selected.some(candidate => candidate.id === entry.id)) continue
+    const size = Buffer.byteLength(JSON.stringify({
+      id: entry.id,
+      scope: entry.scope,
+      status: entry.status,
+      type: entry.type,
+      content: entry.content,
+      tags: entry.tags,
+      conflictGroupId: entry.conflictGroupId,
+    }))
+    if (selected.length >= maxEntries || bytes + size > maxBytes) continue
+    selected.push(entry)
+    bytes += size
+  }
+  return selected
+}
+
+function applyOperations(
+  entries: MemoryEntry[],
+  operations: readonly MemoryOperation[],
+  nowIso: string,
+  uuid: () => string,
+  messages: readonly MemoryMessage[] = [],
+): AppliedOperations {
   let added = 0
   let updated = 0
   let ignored = 0
-  for (const proposal of proposals) {
-    const normalized = normalizeProposal(proposal)
+  let superseded = 0
+  let conflicts = 0
+  const audit: OperationAudit[] = []
+  for (const operation of operations) {
+    const rawOp: unknown = operation.op ?? 'add'
+    if (rawOp !== 'add' && rawOp !== 'revise' && rawOp !== 'supersede' && rawOp !== 'flag-conflict') {
+      ignored += 1
+      audit.push({ op: String(rawOp), status: 'rejected', reason: 'unsupported operation' })
+      continue
+    }
+    if ((operation.targetScope !== undefined && operation.targetScope !== 'global' && operation.targetScope !== 'workspace')
+      || (operation.scope !== undefined && operation.scope !== 'global' && operation.scope !== 'workspace')) {
+      ignored += 1
+      audit.push({ op: rawOp, status: 'rejected', reason: 'invalid scope' })
+      continue
+    }
+    const normalized = normalizeProposal(operation)
     if (normalized === undefined) {
       ignored += 1
+      audit.push({ op: operation.op ?? 'add', status: 'rejected', reason: 'invalid or secret-bearing content' })
+      continue
+    }
+    const op = rawOp
+    const resolution = operation.targetId === undefined ? {} : resolveTarget(entries, operation.targetId)
+    const target = resolution.target
+    if (resolution.branches !== undefined && (op === 'supersede' || op === 'flag-conflict')) {
+      const conflict = createConflict(entries, resolution.branches, normalized, nowIso, uuid)
+      conflicts += 1
+      added += 1
+      audit.push({ op, ...(operation.targetId === undefined ? {} : { targetId: operation.targetId }), status: 'accepted', reason: `non-unique successor downgraded to conflict group ${conflict.group}` })
+      continue
+    }
+    if ((op === 'revise' || op === 'supersede' || op === 'flag-conflict') && (target === undefined || target.status === 'deleted')) {
+      ignored += 1
+      audit.push({ op, ...(operation.targetId === undefined ? {} : { targetId: operation.targetId }), status: 'rejected', reason: 'target not found, deleted, or has a non-unique successor' })
+      continue
+    }
+    if (op === 'supersede' && (target === undefined || !evidenceValid(operation, target, messages))) {
+      ignored += 1
+      audit.push({ op, ...(operation.targetId === undefined ? {} : { targetId: operation.targetId }), status: 'rejected', reason: 'user evidence or verbatim quotes did not validate' })
+      continue
+    }
+    if (op === 'revise' && target !== undefined && tokenDice(target.content, normalized.content) < 0.68) {
+      ignored += 1
+      audit.push({ op, targetId: target.id, status: 'rejected', reason: 'revision is not a near-duplicate; use supersede or flag-conflict' })
+      continue
+    }
+    if (op === 'revise' && target !== undefined && isRecallable(target)) {
+      appendRevision(target, nowIso)
+      target.content = normalized.content
+      target.title = normalized.title
+      target.description = normalized.description
+      target.type = normalized.type
+      target.retrievalTerms = [...new Set([...(target.retrievalTerms ?? []), ...normalized.retrievalTerms])]
+      target.tags = [...new Set([...(target.tags ?? []), ...normalized.tags])]
+      target.importance = Math.max(Number(target.importance ?? 1), normalized.importance)
+      target.updatedAt = nowIso
+      target.provenance = { messageIds: [...(operation.evidenceMessageIds ?? [])], reason: 'revision' }
+      updated += 1
+      audit.push({ op, targetId: target.id, status: 'accepted', reason: 'revised with prior content retained' })
+      continue
+    }
+    if (op === 'supersede' && target !== undefined) {
+      const id = uniqueId(uuid)
+      const supersededEntries = [target]
+      target.status = 'superseded'
+      target.supersededBy = [id]
+      target.updatedAt = nowIso
+      entries.push({
+        id,
+        scope: normalized.scope,
+        type: normalized.type,
+        title: normalized.title,
+        description: normalized.description,
+        retrievalTerms: normalized.retrievalTerms,
+        content: normalized.content,
+        tags: normalized.tags,
+        importance: normalized.importance,
+        status: 'active',
+        supersedes: supersededEntries.map(entry => entry.id),
+        provenance: { messageIds: [...(operation.evidenceMessageIds ?? [])], reason: 'explicit-correction' },
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      })
+      superseded += 1
+      added += 1
+      audit.push({ op, targetId: target.id, status: 'accepted', reason: `superseded ${supersededEntries.length} entr${supersededEntries.length === 1 ? 'y' : 'ies'} by ${id}` })
+      continue
+    }
+    if (op === 'flag-conflict' && target !== undefined) {
+      const conflict = createConflict(entries, [target], normalized, nowIso, uuid)
+      conflicts += 1
+      added += 1
+      audit.push({ op, targetId: target.id, status: 'accepted', reason: `flagged conflict group ${conflict.group}` })
       continue
     }
     const duplicate = entries
-      .filter(entry => entry.status !== 'deleted')
+      .filter(isDedupCandidate)
       .map(entry => ({ entry, similarity: tokenDice(entry.content, normalized.content) }))
       .sort((left, right) => right.similarity - left.similarity)[0]
     if (duplicate !== undefined && duplicate.similarity >= 0.68) {
-      duplicate.entry.content = normalized.content.length >= duplicate.entry.content.length ? normalized.content : duplicate.entry.content
+      appendRevision(duplicate.entry, nowIso)
+      duplicate.entry.content = normalized.content
       duplicate.entry.title = normalized.title
       duplicate.entry.description = normalized.description
       duplicate.entry.type = normalized.type
@@ -727,10 +1046,11 @@ function applyProposals(
       duplicate.entry.importance = Math.max(Number(duplicate.entry.importance ?? 1), normalized.importance)
       duplicate.entry.updatedAt = nowIso
       updated += 1
+      audit.push({ op: 'add', targetId: duplicate.entry.id, status: 'accepted', reason: 'near-duplicate revised with prior content retained' })
       continue
     }
     entries.push({
-      id: `mem-${uuid().replaceAll('-', '').slice(0, 12)}`,
+      id: uniqueId(uuid),
       scope: normalized.scope,
       type: normalized.type,
       title: normalized.title,
@@ -744,8 +1064,9 @@ function applyProposals(
       updatedAt: nowIso,
     })
     added += 1
+    audit.push({ op: 'add', status: 'accepted', reason: 'new durable memory' })
   }
-  return { added, updated, ignored }
+  return { added, updated, ignored, superseded, conflicts, audit }
 }
 
 /** Deep memory module used by both the Cordis adapter and isolated tests. */
@@ -801,6 +1122,15 @@ export class WorkspaceMemoryEngine {
       tags: entry.tags ?? [],
       importance: entry.importance ?? 1,
       score,
+      ...(entry.status === 'conflict' && entry.conflictGroupId === undefined ? { status: 'conflict' as const } : {}),
+      ...(entry.status === 'conflict' && entry.conflictGroupId !== undefined
+        ? {
+            status: 'conflict' as const,
+            conflictWith: entries
+              .filter(candidate => candidate.id !== entry.id && candidate.conflictGroupId === entry.conflictGroupId && isRecallable(candidate))
+              .map(candidate => candidate.id),
+          }
+        : {}),
     }))
     const budget = input.maxBytes ?? this.config.recallMaxBytes
     const boundedSummary = redactSecrets(truncateUtf8(summary, Math.min(budget, this.config.summaryMaxBytes)))
@@ -864,9 +1194,16 @@ export class WorkspaceMemoryEngine {
     if (prepared.kind === 'result') return prepared.result
 
     const distillStartedAt = this.store.now()
-    let proposals: readonly unknown[]
+    let operations: MemoryOperation[]
     try {
-      proposals = safeArray(await this.distill({ scope, messages: prepared.staged, reason: input.reason }))
+      const globalScope = this.store.scope('')
+      const [workspaceEntries, globalEntries] = await Promise.all([
+        this.store.readEntries(scope),
+        scope.key === 'global' ? Promise.resolve([]) : this.store.readEntries(globalScope),
+      ])
+      const existingEntries = selectDistillationCandidates([...globalEntries, ...workspaceEntries], prepared.staged)
+      const distilled = await this.distill({ scope, messages: prepared.staged, reason: input.reason, existingEntries })
+      operations = normalizeOperations(distilled)
       debugMemory('distill-complete', { scope: scope.key, durationMs: Math.max(0, this.store.now() - distillStartedAt), messages: prepared.staged.length })
     } catch (error) {
       debugMemory('distill-error', { scope: scope.key, durationMs: Math.max(0, this.store.now() - distillStartedAt), error: String(error) })
@@ -890,22 +1227,27 @@ export class WorkspaceMemoryEngine {
         const state = await this.store.readState(scope)
         const entries = await this.store.readEntries(scope)
         const nowIso = new Date(this.store.now()).toISOString()
-        const workspaceProposals = proposals.filter(proposal => normalizeProposal(proposal)?.scope !== 'global')
-        const globalProposals = proposals.filter(proposal => normalizeProposal(proposal)?.scope === 'global')
-        const result = applyProposals(entries, workspaceProposals, nowIso, this.store.uuid)
+        const workspaceOperations = scope.key === 'global'
+          ? operations.map(operation => ({ ...operation, scope: 'global' as const, targetScope: 'global' as const }))
+          : operations.filter(operation => operationScope(operation) === 'workspace').map(operation => ({ ...operation, scope: 'workspace' as const }))
+        const globalOperations = scope.key === 'global'
+          ? []
+          : operations.filter(operation => operationScope(operation) === 'global').map(operation => ({ ...operation, scope: 'global' as const }))
+        const result = applyOperations(entries, workspaceOperations, nowIso, this.store.uuid, prepared.staged)
         state.seenMessageIds = [...state.seenMessageIds, ...prepared.staged.map(message => message.id)].slice(-1024)
         const stagedIds = new Set(prepared.staged.map(message => message.id))
         state.pendingMessages = state.pendingMessages.filter(message => !stagedIds.has(message.id))
         state.lastCheckpointAt = this.store.now()
         state.checkpointCount += 1
         await this.store.writeEntries(scope, entries)
-        let globalResult: MutationResult = { added: 0, updated: 0, ignored: 0 }
-        if (globalProposals.length > 0 && scope.key !== 'global') {
+        let globalResult: AppliedOperations = { added: 0, updated: 0, ignored: 0, superseded: 0, conflicts: 0, audit: [] }
+        if (globalOperations.length > 0 && scope.key !== 'global') {
           const globalScope = this.store.scope('')
+          // Cross-scope mutations always acquire workspace before global. No reverse path is allowed.
           globalResult = await this.store.withScope(globalScope, async () => {
             await this.store.ensure(globalScope)
             const globalEntries = await this.store.readEntries(globalScope)
-            const globalMutation = applyProposals(globalEntries, globalProposals, nowIso, this.store.uuid)
+            const globalMutation = applyOperations(globalEntries, globalOperations, nowIso, this.store.uuid, prepared.staged)
             await this.store.writeEntries(globalScope, globalEntries)
             if (globalMutation.added + globalMutation.updated > 0 || !(await this.store.readSummary(globalScope)).trim()) {
               await this.store.rebuildSummary(globalScope, globalEntries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
@@ -913,20 +1255,25 @@ export class WorkspaceMemoryEngine {
             return globalMutation
           })
         }
-        if (state.checkpointCount % this.config.consolidateEvery === 0 || !(await this.store.readSummary(scope)).trim()) {
+        if (result.added + result.updated > 0 || state.checkpointCount % this.config.consolidateEvery === 0 || !(await this.store.readSummary(scope)).trim()) {
           state.version += 1
           await this.store.rebuildSummary(scope, entries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
         }
-        await this.store.writeCheckpoint(scope, input.reason, prepared.staged, proposals, result)
+        const combined: MutationResult = {
+          added: result.added + globalResult.added,
+          updated: result.updated + globalResult.updated,
+          ignored: result.ignored + globalResult.ignored,
+          superseded: (result.superseded ?? 0) + (globalResult.superseded ?? 0),
+          conflicts: (result.conflicts ?? 0) + (globalResult.conflicts ?? 0),
+        }
+        await this.store.writeCheckpoint(scope, input.reason, prepared.staged, operations, combined, [...result.audit, ...globalResult.audit])
         await this.store.writeState(scope, state)
         return {
           status: 'committed' as const,
           scope: scope.key,
           accepted: prepared.accepted,
           pending: state.pendingMessages.length,
-          added: result.added + globalResult.added,
-          updated: result.updated + globalResult.updated,
-          ignored: result.ignored + globalResult.ignored,
+          ...combined,
         }
       })
     } finally {
@@ -948,10 +1295,10 @@ export class WorkspaceMemoryEngine {
       const entries = await this.store.readEntries(scope)
       const proposal = normalizeProposal(input)
       if (proposal === undefined) throw new Error('memory content is empty or contains a credential-like secret')
-      const result = applyProposals(entries, [proposal], new Date(this.store.now()).toISOString(), this.store.uuid)
+      const result = applyOperations(entries, [{ ...proposal, op: 'add' }], new Date(this.store.now()).toISOString(), this.store.uuid)
       await this.store.writeEntries(scope, entries)
       await this.store.rebuildSummary(scope, entries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
-      return { scope: scope.key, ...result }
+      return { scope: scope.key, added: result.added, updated: result.updated, ignored: result.ignored }
     })
   }
 

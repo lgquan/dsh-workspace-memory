@@ -15,7 +15,7 @@ Session 共享一份稳定摘要和长期原子记忆，并通过可选 Cordis �
 - 任务结束、10 轮对话、4000 字符、空闲 5 分钟或 Session 关闭时评估
   checkpoint；不会按固定小时机械写入。
 - Agent turn 结束只进入 checkpoint 缓冲，不会每轮强制调用记忆蒸馏模型。
-- LLM 只蒸馏长期有效事实；重复/近重复事实会更新原条目。
+- LLM 只蒸馏长期有效事实；近重复事实保留修订历史，明确纠正可取代旧事实，疑似冲突会显式分组而不静默覆盖。
 - 提供 `memory_search`、`memory_remember`、`memory_forget` 工具。
 - Web profile 设置中提供“记忆”页面，可查看全局记忆和不同项目的脱敏摘要、结构化条目。
 - 设置页面可以从全局范围选择任意已记录的项目；记忆浏览不依赖当前打开的会话。
@@ -29,7 +29,7 @@ Session 共享一份稳定摘要和长期原子记忆，并通过可选 Cordis �
 ## 安装（NPM）
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.10
+dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.11
 ```
 
 安装后重启 `dsh web`。也可以在 [NPM 页面](https://www.npmjs.com/package/@flowingspring/dsh-workspace-memory)

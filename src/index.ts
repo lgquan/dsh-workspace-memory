@@ -13,6 +13,7 @@ import {
   SUMMARY_FILE,
   WorkspaceMemoryEngine,
   WorkspaceMemoryStore,
+  isRecallable,
   redactSecrets,
   truncateUtf8,
   type CheckpointInput,
@@ -146,19 +147,27 @@ function normalizeJsonOutput(value: unknown): string {
   return start >= 0 && end >= start ? stripped.slice(start, end + 1) : stripped
 }
 
-function parseDistillation(value: unknown): unknown[] {
+function parseDistillation(value: unknown): unknown {
   const parsed: unknown = JSON.parse(normalizeJsonOutput(value))
-  if (!isRecord(parsed) || !Array.isArray(parsed.memories)) {
+  if (!isRecord(parsed) || (!Array.isArray(parsed.memories) && !Array.isArray(parsed.operations))) {
     throw new Error('memory distiller returned an invalid object')
   }
-  return parsed.memories
+  return parsed
 }
 
-function memoryReference(context: Pick<MemoryContext, 'summary' | 'matches'>, includeSummary = true): string {
+interface MemoryReferenceContext {
+  summary: string
+  matches: Array<Omit<MemoryContext['matches'][number], 'status'> & { status?: string }>
+}
+
+function memoryReference(context: MemoryReferenceContext, includeSummary = true): string {
   const sections: string[] = []
   if (includeSummary && context.summary.trim() !== '') sections.push(`稳定摘要：\n${context.summary.trim()}`)
   if (context.matches.length > 0) {
-    sections.push('与当前问题相关的长期记忆：\n' + context.matches.map(item => `- [${item.id}] [${item.type ?? 'fact'}] ${item.title}\n  ${item.description}\n  ${item.content}`).join('\n'))
+    sections.push('与当前问题相关的长期记忆：\n' + context.matches.map(item => {
+      const conflict = item.status === 'conflict' ? ` [存在冲突${(item.conflictWith ?? []).length > 0 ? `：${item.conflictWith?.join(', ')}` : ''}]` : ''
+      return `- [${item.id}] [${item.type ?? 'fact'}]${conflict} ${item.title}\n  ${item.description}\n  ${item.content}`
+    }).join('\n'))
   }
   if (sections.length === 0) return ''
   return [
@@ -196,6 +205,11 @@ interface PublicMemoryEntry {
   importance: number
   createdAt?: string
   updatedAt?: string
+  status: NonNullable<MemoryEntry['status']>
+  conflictGroupId?: string
+  supersedes?: string[]
+  supersededBy?: string[]
+  revisions?: MemoryEntry['revisions']
 }
 
 function sendJson(response: ServerResponse, status: number, value: unknown): void {
@@ -216,6 +230,11 @@ function publicEntry(entry: MemoryEntry): PublicMemoryEntry {
     content: redactSecrets(entry.content),
     tags: (entry.tags ?? []).map(tag => redactSecrets(tag)),
     importance: entry.importance ?? 1,
+    status: entry.status ?? 'active',
+    ...(entry.conflictGroupId === undefined ? {} : { conflictGroupId: entry.conflictGroupId }),
+    ...(entry.supersedes === undefined ? {} : { supersedes: [...entry.supersedes] }),
+    ...(entry.supersededBy === undefined ? {} : { supersededBy: [...entry.supersededBy] }),
+    ...(entry.revisions === undefined ? {} : { revisions: entry.revisions.map(revision => ({ ...revision, content: redactSecrets(revision.content), title: redactSecrets(revision.title), description: redactSecrets(revision.description) })) }),
     ...(entry.createdAt === undefined ? {} : { createdAt: entry.createdAt }),
     ...(entry.updatedAt === undefined ? {} : { updatedAt: entry.updatedAt }),
   }
@@ -374,7 +393,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
     this.idleTimers.set(result.scope, timer)
   }
 
-  private async distill({ messages, reason }: DistillInput): Promise<readonly unknown[]> {
+  private async distill({ messages, reason, existingEntries = [] }: DistillInput): Promise<unknown> {
     const llm = this.ctx.get('llm')
     if (llm === undefined) throw new Error('no LLM runtime is available for memory distillation')
     const configured = this.settings.summarizeProvider !== '' && this.settings.summarizeModel !== ''
@@ -384,15 +403,31 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
       throw new Error('no model route is available for memory distillation')
     }
     const excerpt = messages.map(message => `${message.role === 'user' ? '用户' : '助手'}：${message.text}`).join('\n')
+    const existing = existingEntries.map(entry => ({
+      id: entry.id,
+      scope: entry.scope,
+      status: entry.status,
+      type: entry.type,
+      content: redactSecrets(entry.content),
+      tags: entry.tags?.map(tag => redactSecrets(tag)),
+      conflictGroupId: entry.conflictGroupId,
+    }))
     const request = createUserMessage({
       content: [{
         type: 'text',
         text: [
           `Checkpoint reason: ${reason}`,
           '',
-          '从下面的对话中提取值得跨 Session 保存的原子事实。只保留：用户明确偏好、项目事实、最终决策及原因、约定、错误修复、明确要求记住的内容。',
-          '忽略寒暄、临时任务、进度播报、未确认猜测、密钥和凭据。每条只表达一个事实。',
-          '只输出一行 JSON：{"memories":[{"scope":"workspace","type":"fact","title":"...","description":"...","content":"...","tags":["project"],"retrievalTerms":["同义词"],"importance":0}]}。scope 只能是 global 或 workspace；全局只保存用户长期偏好和通用工作方式，项目事实保存到 workspace。type 只能是 preference/decision/architecture/rule/fact/fix。没有内容时输出 {"memories":[]}。',
+          '从下面的对话中整理值得跨 Session 保存的原子事实。只保留用户明确偏好、项目事实、最终决策及原因、约定、错误修复和明确要求记住的内容。',
+          '输出肯定、可判断且带适用条件的陈述；否定事实应同时说明原因或替代方案。忽略寒暄、临时任务、进度播报、未确认猜测、密钥和凭据。',
+          '输出 version=1 的 operations。op 只能是 add/revise/supersede/flag-conflict。revise/supersede/flag-conflict 必须引用 existing_memories 中的 targetId 和 targetScope。',
+          '只有用户消息明确纠正旧事实时才输出 supersede；必须提供 evidenceMessageIds、newQuote 和 oldQuote。newQuote 必须逐字来自对应用户消息，oldQuote 必须逐字来自 target.content。证据不足或只是助手自行发现时使用 flag-conflict。confidence 不能代替这些证据。',
+          '同义改写使用 revise；无关事实使用 add。scope/targetScope 只能是 global 或 workspace；全局只保存用户长期偏好和通用工作方式。type 只能是 preference/decision/architecture/rule/fact/fix。',
+          '只输出一行 JSON：{"version":1,"operations":[{"op":"add","scope":"workspace","type":"fact","title":"...","description":"...","content":"...","tags":["project"],"retrievalTerms":["同义词"],"importance":1}]}。没有操作时输出 {"version":1,"operations":[]}。',
+          '',
+          '<existing_memories>',
+          JSON.stringify(existing),
+          '</existing_memories>',
           '',
           '<conversation>',
           excerpt,
@@ -505,6 +540,8 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
                     tags: { type: 'array', required: true, items: { type: 'string' } },
                     importance: { type: 'number', required: true },
                     score: { type: 'number', required: true },
+                    status: { type: 'string' },
+                    conflictWith: { type: 'array', items: { type: 'string' } },
                   },
                 },
               },
@@ -576,7 +613,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
             const scopes = await this.store.listScopes()
             const views = await Promise.all(scopes.map(async (scope) => {
               const snapshot = await this.store.readSnapshot(scope)
-              const active = snapshot.entries.filter(entry => entry.status !== 'deleted')
+              const active = snapshot.entries.filter(isRecallable)
               const updatedAt = active
                 .map(entry => entry.updatedAt ?? entry.createdAt ?? '')
                 .filter(Boolean)
@@ -608,7 +645,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
             const scopes = await this.store.listArchivedScopes()
             const views = await Promise.all(scopes.map(async (scope) => {
               const snapshot = await this.store.readArchivedSnapshot(scope)
-              const active = snapshot.entries.filter(entry => entry.status !== 'deleted')
+              const active = snapshot.entries.filter(isRecallable)
               return {
                 key: scope.key,
                 cwd: scope.cwd,
