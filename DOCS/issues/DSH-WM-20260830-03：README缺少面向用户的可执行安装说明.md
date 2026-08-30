@@ -40,3 +40,4 @@ README 同时承担了用户指南和架构说明，信息层级没有按下载�
 - 2026-08-30：将 GitHub 安装方式收敛为预构建 Release 附件，避免要求用户运行仓库构建脚本或修改 profile 的 `allowBuilds`。
 - 2026-08-30：创建 GitHub Release `v0.2.12`，上传 `flowingspring-dsh-workspace-memory-0.2.12.tgz`。
 - 2026-08-30：从公开 Release URL 在全新临时项目中安装成功；确认版本为 `0.2.12`，`lib/index.js`、`cordis.patch.yml` 均存在，`@flowingspring/dsh-workspace-memory/core` 可正常导入。
+- 2026-08-30：发布 NPM 与 GitHub Release `v0.2.13`；NPM `latest` 已指向 `0.2.13`，Registry 返回的 README 已确认包含 NPM 安装、GitHub 安装和常见问题章节。
