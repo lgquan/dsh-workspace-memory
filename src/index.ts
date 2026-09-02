@@ -266,6 +266,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
 
   private readonly settings: ResolvedConfig
   private readonly idleTimers = new Map<string, NodeJS.Timeout>()
+  private readonly retryAttempts = new Map<string, number>()
   private readonly store: WorkspaceMemoryStore
   private readonly engine: WorkspaceMemoryEngine
   private readonly surfacedBySession = new Map<string, Set<string>>()
@@ -287,9 +288,12 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
     this.installAgentCheckpointing(ctx)
     this.installTools(ctx)
     this.installBrowserApi(ctx)
+    // Pending messages survive process restarts; restore their idle checkpoint work.
+    void this.recoverPendingCheckpoints()
     ctx.effect(() => () => {
       for (const timer of this.idleTimers.values()) clearTimeout(timer)
       this.idleTimers.clear()
+      this.retryAttempts.clear()
       this.surfacedBySession.clear()
     }, 'workspace-memory idle checkpoints')
     ctx.logger.info('workspace-memory ready (dir=%s)', this.settings.memoryDir)
@@ -382,15 +386,47 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
     const previous = this.idleTimers.get(result.scope)
     if (previous !== undefined) clearTimeout(previous)
     this.idleTimers.delete(result.scope)
-    if (result.pending === 0 || result.status === 'failed') return
+    if (result.pending === 0) return
+    const delay = result.status === 'failed' ? this.nextRetryDelay(result.scope) : this.settings.idleCheckpointMs
+    if (result.status !== 'failed') this.retryAttempts.delete(result.scope)
+    this.scheduleIdleCheckpoint(cwd, result.scope, delay)
+    if (result.status === 'failed') {
+      this.ctx.logger.warn('workspace-memory checkpoint will retry in %dms', delay)
+    }
+  }
+
+  private nextRetryDelay(scopeKey: string): number {
+    const attempt = (this.retryAttempts.get(scopeKey) ?? 0) + 1
+    this.retryAttempts.set(scopeKey, attempt)
+    return Math.min(30_000, 1000 * 2 ** Math.min(attempt - 1, 5))
+  }
+
+  private scheduleIdleCheckpoint(cwd: string, scopeKey: string, delayMs: number): void {
+    const previous = this.idleTimers.get(scopeKey)
+    if (previous !== undefined) clearTimeout(previous)
     const timer = setTimeout(() => {
-      this.idleTimers.delete(result.scope)
+      this.idleTimers.delete(scopeKey)
       void this.checkpoint({ cwd, messages: [], reason: 'idle' }).catch(error => {
         this.ctx.logger.warn('workspace-memory idle checkpoint failed: %o', error)
       })
-    }, this.settings.idleCheckpointMs)
+    }, Math.max(0, delayMs))
     timer.unref?.()
-    this.idleTimers.set(result.scope, timer)
+    this.idleTimers.set(scopeKey, timer)
+  }
+
+  private async recoverPendingCheckpoints(): Promise<void> {
+    try {
+      const now = Date.now()
+      for (const scope of await this.store.listScopes()) {
+        const state = await this.store.readState(scope)
+        if (state.pendingMessages.length === 0) continue
+        const elapsed = state.lastBufferedAt > 0 ? Math.max(0, now - state.lastBufferedAt) : this.settings.idleCheckpointMs
+        const remaining = Math.max(0, this.settings.idleCheckpointMs - elapsed)
+        this.scheduleIdleCheckpoint(scope.cwd, scope.key, remaining)
+      }
+    } catch (error) {
+      this.ctx.logger.warn('workspace-memory pending checkpoint recovery failed: %o', error)
+    }
   }
 
   private async distill({ messages, reason, existingEntries = [] }: DistillInput): Promise<unknown> {

@@ -10,6 +10,7 @@ import LlmRuntime, { LlmAdapter, type GenerateOptions, type StreamChunk } from '
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
+import { WorkspaceMemoryStore } from '../src/core.ts'
 import WorkspaceMemoryRuntime from '../src/index.ts'
 
 class MemoryAdapter extends LlmAdapter {
@@ -21,6 +22,25 @@ class MemoryAdapter extends LlmAdapter {
     }
     yield { type: 'finish', reason: { kind: 'stop' } }
   }
+}
+
+class SequenceMemoryAdapter extends LlmAdapter {
+  private index = 0
+
+  constructor(private readonly outputs: readonly string[]) {
+    super()
+  }
+
+  async *stream(_options: GenerateOptions): AsyncGenerator<StreamChunk> {
+    const output = this.outputs[Math.min(this.index++, this.outputs.length - 1)] ?? '{}'
+    yield { type: 'text-delta', index: 0, text: output }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+}
+
+async function flushAsyncWork(): Promise<void> {
+  await new Promise<void>(resolve => setImmediate(resolve))
+  await new Promise<void>(resolve => setImmediate(resolve))
 }
 
 test('Cordis adapter distils, stores, recalls, and registers explicit tools', async () => {
@@ -92,4 +112,79 @@ test('Cordis adapter distils, stores, recalls, and registers explicit tools', as
   assert.ok(ctx.tools.get('memory_search'))
   assert.ok(ctx.tools.get('memory_remember'))
   assert.ok(ctx.tools.get('memory_forget'))
+})
+
+test('recovers an overdue pending scope when the runtime starts', async () => {
+  const memoryDir = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-recovery-'))
+  const workspace = join(memoryDir, 'project')
+  onTestFinished(async () => {
+    await rm(memoryDir, { recursive: true, force: true })
+  })
+  const seedStore = new WorkspaceMemoryStore(memoryDir)
+  const scope = seedStore.scope(workspace)
+  await seedStore.ensure(scope)
+  const state = await seedStore.readState(scope)
+  state.pendingMessages = [{ id: 'recovered-user', role: 'user', text: '服务启动后应自动整理这条消息。' }]
+  state.lastBufferedAt = Date.now() - 10_000
+  await seedStore.writeState(scope, state)
+
+  const ctx = new Context()
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(LlmRuntime)
+  ctx.llm.registerAdapter(['test'], new MemoryAdapter())
+  await ctx.plugin(AgentDefaultModel, { provider: 'test', model: 'test' })
+  await ctx.plugin(SystemPrompt)
+  await ctx.plugin(ToolRuntime)
+  await ctx.plugin(WorkspaceMemoryRuntime, {
+    memoryDir,
+    checkpointTurns: 10,
+    checkpointChars: 4000,
+    idleCheckpointMs: 1000,
+  })
+  await flushAsyncWork()
+  const session = ctx.sessions.create(SessionId('recovery-runtime-test'), { meta: { cwd: workspace } })
+  const memory = ctx.get('workspaceMemory')
+  assert.ok(memory)
+  await new Promise(resolve => setTimeout(resolve, 50))
+  await flushAsyncWork()
+  assert.equal((await seedStore.readState(scope)).pendingMessages.length, 0)
+  const recovered = await memory.recall({ sessionId: session.id, query: 'Voco 可选接口' })
+  assert.match(recovered.summary, /workspaceMemory/u)
+})
+
+test('retries a failed checkpoint automatically', async () => {
+  const memoryDir = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-retry-'))
+  const workspace = join(memoryDir, 'project')
+  onTestFinished(async () => {
+    await rm(memoryDir, { recursive: true, force: true })
+  })
+  const ctx = new Context()
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(LlmRuntime)
+  ctx.llm.registerAdapter(['test'], new SequenceMemoryAdapter([
+    'not valid json',
+    '{"version":1,"operations":[{"op":"add","content":"重试成功后写入的事实。"}]}',
+  ]))
+  await ctx.plugin(AgentDefaultModel, { provider: 'test', model: 'test' })
+  await ctx.plugin(SystemPrompt)
+  await ctx.plugin(ToolRuntime)
+  await ctx.plugin(WorkspaceMemoryRuntime, {
+    memoryDir,
+    checkpointTurns: 1,
+    idleCheckpointMs: 1000,
+  })
+  await flushAsyncWork()
+  const session = ctx.sessions.create(SessionId('retry-runtime-test'), { meta: { cwd: workspace } })
+  const memory = ctx.get('workspaceMemory')
+  assert.ok(memory)
+  const first = await memory.checkpoint({
+    sessionId: session.id,
+    reason: 'segment-end',
+    messages: [{ id: 'retry-user', role: 'user', text: '第一次蒸馏会失败。' }],
+  })
+  assert.equal(first.status, 'failed', JSON.stringify(first))
+  await new Promise(resolve => setTimeout(resolve, 1200))
+  await flushAsyncWork()
+  const state = await new WorkspaceMemoryStore(memoryDir).readState(new WorkspaceMemoryStore(memoryDir).scope(workspace))
+  assert.equal(state.pendingMessages.length, 0)
 })

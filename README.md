@@ -24,7 +24,7 @@
 在 PowerShell 或终端中运行：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.14
+dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.15
 ```
 
 NPM 包地址：[@flowingspring/dsh-workspace-memory](https://www.npmjs.com/package/@flowingspring/dsh-workspace-memory)
@@ -34,10 +34,10 @@ NPM 包地址：[@flowingspring/dsh-workspace-memory](https://www.npmjs.com/pack
 直接安装 GitHub Release 中的预构建插件包：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.2.14/flowingspring-dsh-workspace-memory-0.2.14.tgz
+dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.2.15/flowingspring-dsh-workspace-memory-0.2.15.tgz
 ```
 
-Release 页面：[v0.2.14](https://github.com/lgquan/dsh-workspace-memory/releases/tag/v0.2.14)
+Release 页面：[v0.2.15](https://github.com/lgquan/dsh-workspace-memory/releases/tag/v0.2.15)
 
 ## 安装后怎么使用
 
@@ -65,13 +65,13 @@ dsh plugin --profile web list
 使用 NPM 更新到指定版本：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.14
+dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.15
 ```
 
 使用 GitHub 更新到指定标签：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.2.14/flowingspring-dsh-workspace-memory-0.2.14.tgz
+dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.2.15/flowingspring-dsh-workspace-memory-0.2.15.tgz
 ```
 
 更新后重启 `dsh web`。
@@ -105,6 +105,8 @@ dsh plugin --profile web remove --config.minimumReleaseAge=0 @flowingspring/dsh-
 - 连续空闲 5 分钟；
 - Session 关闭；
 - 调用方显式要求立即整理。
+
+插件会在服务启动时恢复已有项目的待整理消息：已经超过空闲阈值的内容会立即尝试整理，尚未超时的内容会按剩余时间触发。若模型或网络导致一次整理失败，插件会自动使用退避间隔重试，并在成功提交前保留待整理消息。
 
 因此，刚聊完但尚未达到阈值、没有空闲足够时间或 Session 仍在继续时，设置页里暂时看不到新记忆是正常现象。
 
