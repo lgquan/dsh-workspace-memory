@@ -13,7 +13,7 @@
 
 ## 安装前提
 
-- 已安装 DeepSeek Harness；
+- 已安装 DeepSeek Harness `0.2.1-rc.2` 或兼容的更新版本；
 - 使用 DSH 的 `web` profile；
 - Node.js `>= 22.19.0`。
 
@@ -24,7 +24,7 @@
 在 PowerShell 或终端中运行：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.15
+dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.16
 ```
 
 NPM 包地址：[@flowingspring/dsh-workspace-memory](https://www.npmjs.com/package/@flowingspring/dsh-workspace-memory)
@@ -34,10 +34,10 @@ NPM 包地址：[@flowingspring/dsh-workspace-memory](https://www.npmjs.com/pack
 直接安装 GitHub Release 中的预构建插件包：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.2.15/flowingspring-dsh-workspace-memory-0.2.15.tgz
+dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.2.16/flowingspring-dsh-workspace-memory-0.2.16.tgz
 ```
 
-Release 页面：[v0.2.15](https://github.com/lgquan/dsh-workspace-memory/releases/tag/v0.2.15)
+Release 页面：[v0.2.16](https://github.com/lgquan/dsh-workspace-memory/releases/tag/v0.2.16)
 
 ## 安装后怎么使用
 
@@ -65,13 +65,13 @@ dsh plugin --profile web list
 使用 NPM 更新到指定版本：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.15
+dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.2.16
 ```
 
 使用 GitHub 更新到指定标签：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.2.15/flowingspring-dsh-workspace-memory-0.2.15.tgz
+dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.2.16/flowingspring-dsh-workspace-memory-0.2.16.tgz
 ```
 
 更新后重启 `dsh web`。

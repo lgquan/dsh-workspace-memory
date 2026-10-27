@@ -4,11 +4,14 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { Service, type Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { WebServer } from '@deepseek-ai/dsh-host-webserver'
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
+import type {} from '@deepseek-ai/dsh-session-persistence'
 import type { AssembleContext, SystemPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { defineTool, type ToolRuntime } from '@deepseek-ai/dsh-tools'
+import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace'
 import {
   SUMMARY_FILE,
   WorkspaceMemoryEngine,
@@ -30,6 +33,12 @@ import {
 } from './core.js'
 
 export const name = 'workspace-memory'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'workspace-memory': { readonly kind: 'workspace-memory' }
+  }
+}
 
 const DEFAULTS = Object.freeze({
   checkpointTurns: 10,
@@ -128,13 +137,14 @@ function messageText(message: unknown): string {
 
 function conversationMessages(agent: Agent): MemoryMessage[] {
   const messages: MemoryMessage[] = []
-  for (const event of agent.session.events.slice(-80)) {
-    if (event.type === 'user/message') {
-      const text = messageText(event.data)
-      if (text !== '') messages.push({ id: String(event.data.id), role: 'user', text })
-    } else if (event.type === 'assistant/message') {
-      const text = messageText(event.data.message)
-      if (text !== '') messages.push({ id: String(event.data.message.id), role: 'assistant', text })
+  for (const message of agent.session.deriveMessages().slice(-80)) {
+    if (message.role === 'user') {
+      if (message.source.kind === 'workspace-memory') continue
+      const text = messageText(message)
+      if (text !== '') messages.push({ id: String(message.id), role: 'user', text })
+    } else if (message.role === 'assistant') {
+      const text = messageText(message)
+      if (text !== '') messages.push({ id: String(message.id), role: 'assistant', text })
     }
   }
   return messages
@@ -180,18 +190,6 @@ function memoryReference(context: MemoryReferenceContext, includeSummary = true)
 
 function outputText(value: string): ContentBlock[] {
   return [{ type: 'text', text: value }]
-}
-
-interface MemoryWebServer {
-  register(route: {
-    kind: 'exact' | 'prefix'
-    path: string
-    handler: (request: IncomingMessage, response: ServerResponse) => void | Promise<void>
-  }): () => void
-}
-
-interface WorkspaceRegistryLike {
-  list(): ReadonlyArray<{ path: string }>
 }
 
 interface PublicMemoryEntry {
@@ -360,7 +358,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
     if (this.syncOrphanedScopesPromise !== undefined) return this.syncOrphanedScopesPromise
     if (now - this.syncOrphanedScopesAt < 30_000) return
     this.syncOrphanedScopesAt = now
-    const registry = this.ctx.get('workspaceRegistry') as WorkspaceRegistryLike | undefined
+    const registry = this.ctx.get('workspaceRegistry') as WorkspaceRegistry | undefined
     if (registry === undefined) return
     this.syncOrphanedScopesPromise = (async () => {
       const active = new Set(registry.list().map(workspace => normalizeWorkspacePath(workspace.path)))
@@ -378,8 +376,8 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
     if (input.sessionId === undefined) return ''
     const live = this.ctx.get('sessions')?.get(input.sessionId)
     if (live?.header?.cwd !== undefined) return live.header.cwd
-    const persisted = await this.ctx.get('sessionPersistence')?.inspect(input.sessionId)
-    return persisted?.header?.cwd ?? ''
+    const persisted = await this.ctx.get('sessionPersistence')?.stat(input.sessionId)
+    return persisted?.header.cwd ?? ''
   }
 
   private updateIdleTimer(cwd: string, result: CheckpointResult): void {
@@ -470,7 +468,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
           '</conversation>',
         ].join('\n'),
       }],
-      source: { kind: 'plugin', plugin: name },
+      source: { kind: 'workspace-memory' },
     })
     let output = ''
     for await (const chunk of llm.stream({
@@ -530,7 +528,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
         kind: 'enter',
         messages: [...decision.messages, createUserMessage({
           content: [{ type: 'text', text: reference }],
-          source: { kind: 'plugin', plugin: name },
+          source: { kind: 'workspace-memory' },
         })],
       }
     })
@@ -639,7 +637,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
   /** Expose a redacted, read-only projection for the settings memory browser. */
   private installBrowserApi(ctx: Context): void {
     ctx.inject(['webServer'], (hostCtx) => {
-      const webServer = (hostCtx as unknown as { webServer: MemoryWebServer }).webServer
+      const webServer = hostCtx.webServer as WebServer
       const listDisposer = webServer.register({
         kind: 'exact',
         path: '/workspace-memory/api/v1/scopes',

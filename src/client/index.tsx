@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { createElement as h } from 'react'
 import type { SettingsSectionOwnerProps } from '@deepseek-ai/dsh-client-ui-settings/client'
+import type {} from '@deepseek-ai/dsh-client-ui-slots'
 
 const NS = 'workspace-memory'
 

@@ -3,10 +3,10 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { onTestFinished, test } from 'vitest'
-import { Context } from '@deepseek-ai/cordis'
+import { Context, Service } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import AgentDefaultModel from '@deepseek-ai/dsh-agent-default-model'
-import LlmRuntime, { LlmAdapter, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { createUserMessage, LlmAdapter, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
@@ -34,6 +34,20 @@ class SequenceMemoryAdapter extends LlmAdapter {
   async *stream(_options: GenerateOptions): AsyncGenerator<StreamChunk> {
     const output = this.outputs[Math.min(this.index++, this.outputs.length - 1)] ?? '{}'
     yield { type: 'text-delta', index: 0, text: output }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+}
+
+class CapturingMemoryAdapter extends LlmAdapter {
+  readonly requests: GenerateOptions[] = []
+
+  async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
+    this.requests.push(options)
+    yield {
+      type: 'text-delta',
+      index: 0,
+      text: '{"version":1,"operations":[{"op":"add","content":"新版会话事件能够触发记忆整理。","tags":["compatibility"],"importance":2}]}',
+    }
     yield { type: 'finish', reason: { kind: 'stop' } }
   }
 }
@@ -187,4 +201,84 @@ test('retries a failed checkpoint automatically', async () => {
   await flushAsyncWork()
   const state = await new WorkspaceMemoryStore(memoryDir).readState(new WorkspaceMemoryStore(memoryDir).scope(workspace))
   assert.equal(state.pendingMessages.length, 0)
+})
+
+test('checkpoints derived DSH 0.2.1 messages without re-distilling recalled memory', async () => {
+  const memoryDir = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-events-'))
+  const workspace = join(memoryDir, 'project')
+  const ctx = new Context()
+  const adapter = new CapturingMemoryAdapter()
+  onTestFinished(async () => {
+    await rm(memoryDir, { recursive: true, force: true })
+  })
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(LlmRuntime)
+  ctx.llm.registerAdapter(['test'], adapter)
+  await ctx.plugin(AgentDefaultModel, { provider: 'test', model: 'test' })
+  await ctx.plugin(SystemPrompt)
+  await ctx.plugin(ToolRuntime)
+  await ctx.plugin(WorkspaceMemoryRuntime, {
+    memoryDir,
+    checkpointTurns: 1,
+    consolidateEvery: 1,
+  })
+  await flushAsyncWork()
+
+  const session = ctx.sessions.create(SessionId('memory-runtime-events'), { meta: { cwd: workspace } })
+  session.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: '这段召回内容不能再次进入蒸馏。' }],
+    source: { kind: 'workspace-memory' },
+  }), { surfaceOp: 'append' })
+  session.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: '请记住新版会话事件已经兼容。' }],
+    source: { kind: 'user' },
+  }), { surfaceOp: 'append' })
+
+  const agent = { session } as Agent
+  ctx.emit('agent/turn-stopping', { agent, turn: 1, signal: new AbortController().signal })
+  for (let attempt = 0; attempt < 20 && adapter.requests.length === 0; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+
+  assert.equal(adapter.requests.length, 1)
+  const requestText = adapter.requests[0]!.messages
+    .flatMap(message => message.content)
+    .flatMap(block => block.type === 'text' ? [block.text] : [])
+    .join('\n')
+  assert.match(requestText, /请记住新版会话事件已经兼容/u)
+  assert.doesNotMatch(requestText, /这段召回内容不能再次进入蒸馏/u)
+  const memory = ctx.get('workspaceMemory')
+  assert.ok(memory)
+  const recalled = await memory.recall({ sessionId: session.id, query: '新版会话事件' })
+  assert.equal(recalled.matches[0]?.content, '新版会话事件能够触发记忆整理。')
+})
+
+test('resolves a persisted DSH 0.2.1 session workspace through stat()', async () => {
+  const memoryDir = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-persisted-'))
+  const workspace = join(memoryDir, 'persisted-project')
+  let statCalls = 0
+  class FakeSessionPersistence extends Service {
+    constructor(serviceCtx: Context) { super(serviceCtx, 'sessionPersistence') }
+    async stat(): Promise<{ header: { cwd: string } }> {
+      statCalls += 1
+      return { header: { cwd: workspace } }
+    }
+  }
+
+  const ctx = new Context()
+  onTestFinished(async () => {
+    await rm(memoryDir, { recursive: true, force: true })
+  })
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(FakeSessionPersistence)
+  await ctx.plugin(WorkspaceMemoryRuntime, { memoryDir })
+  await flushAsyncWork()
+
+  const memory = ctx.get('workspaceMemory')
+  assert.ok(memory)
+  const sessionId = SessionId('persisted-memory-runtime-test')
+  const stored = await memory.remember({ sessionId, content: '持久化会话仍然写入原项目记忆。' })
+  assert.equal(stored.scope, new WorkspaceMemoryStore(memoryDir).scope(workspace).key)
+  assert.equal(stored.added, 1)
+  assert.equal(statCalls, 1)
 })
