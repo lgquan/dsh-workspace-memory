@@ -204,7 +204,7 @@ test('shares memory for the same cwd and isolates another workspace', async () =
   const shared = await f.engine.recall({ cwd: firstCwd, query: '语音聊天 Agent' })
   const isolated = await f.engine.recall({ cwd: secondCwd, query: '语音聊天 Agent' })
   assert.equal(shared.matches[0]?.content, '项目的语音前台聊天绕过 Agent Loop。')
-  assert.match(shared.summary, /语音前台/u)
+  assert.equal(shared.summary, '')
   assert.equal(isolated.matches.length, 0)
   assert.equal(isolated.summary, '')
 })
@@ -350,19 +350,24 @@ test('rejects credential-shaped explicit memories', async () => {
   )
 })
 
-test('keeps only the configured number of previous summaries', async () => {
+test('keeps only the configured number of semantic generations', async () => {
   const f = await fixture({ config: { keepSummaryVersions: 1 } })
   onTestFinished(f.cleanup)
   const cwd = join(f.root, 'workspace')
-  await f.engine.remember({ cwd, content: '第一条长期事实。' })
-  await f.engine.remember({ cwd, content: '第二条长期事实。' })
-  await f.engine.remember({ cwd, content: '第三条长期事实。' })
   const scope = f.store.scope(cwd)
-  const history = await readdir(join(scope.dir, 'summary_history'))
-  assert.equal(history.length, 1)
+  await f.engine.remember({ cwd, content: '第一条长期事实。' })
+  for (const content of ['第一版语义内容。', '第二版语义内容。', '第三版语义内容。']) {
+    const prepared = await f.store.prepareSemanticSummary(scope, 0)
+    assert.equal(prepared.status, 'ready')
+    if (prepared.status !== 'ready') throw new Error('semantic representation was not ready')
+    await f.store.commitSemanticSummary(scope, prepared, [{ id: 'project-overview', content, sourceIds: prepared.dirtyTopics[0]?.entries.map(entry => entry.id) ?? [] }], 2000, 1)
+    f.advance(1)
+  }
+  const generations = await readdir(join(scope.dir, 'representations', 'generations'))
+  assert.equal(generations.length, 1)
 })
 
-test('uses a validated semantic summary until a memory mutation restores the deterministic fallback', async () => {
+test('publishes validated semantic topics and invalidates only dirty content after mutation', async () => {
   const f = await fixture()
   onTestFinished(f.cleanup)
   const cwd = join(f.root, 'workspace-semantic-summary')
@@ -370,50 +375,92 @@ test('uses a validated semantic summary until a memory mutation restores the det
   const scope = f.store.scope(cwd)
   const entry = (await f.store.readEntries(scope))[0]
   assert.ok(entry)
-  assert.equal((await f.store.readSummaryMetadata(scope))?.mode, 'deterministic')
-
-  const prepared = await f.store.prepareSemanticSummary(scope, 0, 2000, 2)
+  assert.equal(await f.store.readSummary(scope), '')
+  const prepared = await f.store.prepareSemanticSummary(scope, 0)
   assert.equal(prepared.status, 'ready')
   if (prepared.status !== 'ready') throw new Error('semantic summary was not ready')
   assert.equal(await f.store.commitSemanticSummary(
     scope,
-    prepared.sourceHash,
-    '- 用户画像：现居火星。',
-    ['missing-entry'],
+    prepared,
+    [{ id: 'architecture', content: '现居火星。', sourceIds: [entry.id] }],
     2000,
     2,
   ), false)
   assert.doesNotMatch(await f.store.readSummary(scope), /火星/u)
   assert.equal(await f.store.commitSemanticSummary(
     scope,
-    prepared.sourceHash,
-    '- 用户画像：现居上海。',
-    [entry.id],
+    prepared,
+    [{ id: 'project-overview', content: '用户画像：现居上海。', sourceIds: [entry.id] }],
     2000,
     2,
   ), true)
-  assert.equal((await f.store.readSummaryMetadata(scope))?.mode, 'semantic')
+  assert.ok(await f.store.readRepresentationManifest(scope))
   assert.match(await f.store.readSummary(scope), /用户画像：现居上海/u)
 
+  await f.engine.remember({ cwd, content: '项目采用事件驱动架构。', type: 'architecture', title: '项目架构' })
+  const architecture = await f.store.prepareSemanticSummary(scope, 86_400_000)
+  assert.equal(architecture.status, 'ready')
+  if (architecture.status !== 'ready') throw new Error('architecture topic was not ready')
+  assert.deepEqual(architecture.dirtyTopics.map(topic => topic.id), ['architecture'])
+  assert.equal(await f.store.commitSemanticSummary(
+    scope,
+    architecture,
+    [{ id: 'architecture', content: '项目采用事件驱动架构。', sourceIds: architecture.dirtyTopics[0]?.entries.map(item => item.id) ?? [] }],
+    2000,
+    2,
+  ), true)
+  assert.match(await f.store.readTopic(scope, 'architecture'), /事件驱动/u)
+
   await f.engine.update({ cwd, id: entry.id, content: '用户现居北京市。', title: '现居城市', description: '用户长期居住在北京' })
-  assert.equal((await f.store.readSummaryMetadata(scope))?.mode, 'deterministic')
   assert.doesNotMatch(await f.store.readSummary(scope), /用户画像：现居上海/u)
-  assert.match(await f.store.readSummary(scope), /用户长期居住在北京/u)
-  assert.equal((await f.store.prepareSemanticSummary(scope, 86_400_000, 2000, 2)).status, 'wait')
+  assert.doesNotMatch(await f.store.readSummary(scope), /用户长期居住在北京/u)
+  assert.match(await f.store.readSummary(scope), /事件驱动/u)
+  assert.doesNotMatch(await f.store.readIndex(scope, 2000), /project-overview/u)
+  assert.match(await f.store.readIndex(scope, 2000), /architecture/u)
+  const changed = await f.store.prepareSemanticSummary(scope, 86_400_000)
+  assert.equal(changed.status, 'ready')
+  if (changed.status !== 'ready') throw new Error('changed topic was not ready')
+  assert.deepEqual(changed.dirtyTopics.map(topic => topic.id), ['project-overview'])
+  await f.engine.update({ cwd, id: entry.id, content: '用户现居深圳市。', title: '现居城市', description: '用户长期居住在深圳' })
+  assert.equal(await f.store.commitSemanticSummary(
+    scope,
+    changed,
+    [{ id: 'project-overview', content: '用户画像：现居北京。', sourceIds: [entry.id] }],
+    2000,
+    2,
+  ), false)
+  assert.doesNotMatch(await f.store.readSummary(scope), /现居北京/u)
+  const refreshed = await f.store.prepareSemanticSummary(scope, 86_400_000)
+  assert.equal(refreshed.status, 'ready')
+  if (refreshed.status !== 'ready') throw new Error('refreshed topic was not ready')
+  assert.equal(await f.store.commitSemanticSummary(
+    scope,
+    refreshed,
+    [{ id: 'project-overview', content: '用户画像：现居深圳。', sourceIds: [entry.id] }],
+    2000,
+    2,
+  ), true)
+  assert.match(await f.store.readSummary(scope), /用户画像：现居深圳/u)
+  assert.match(await f.store.readSummary(scope), /事件驱动/u)
+  assert.ok(Buffer.byteLength(await f.store.readSummary(scope)) <= 2000)
+  assert.equal((await f.store.prepareSemanticSummary(scope, 86_400_000)).status, 'clean')
   f.advance(86_400_000)
-  assert.equal((await f.store.prepareSemanticSummary(scope, 86_400_000, 2000, 2)).status, 'ready')
+  const periodic = await f.store.prepareSemanticSummary(scope, 86_400_000)
+  assert.equal(periodic.status, 'ready')
+  if (periodic.status !== 'ready') throw new Error('periodic refresh was not ready')
+  assert.deepEqual(periodic.dirtyTopics.filter(topic => topic.entries.length > 0).map(topic => topic.id), ['project-overview', 'architecture'])
 })
 
-test('repairs a missing or stale summary from canonical entries without a model call', async () => {
+test('marks a missing semantic representation for background refresh without publishing raw entries', async () => {
   const f = await fixture()
   onTestFinished(f.cleanup)
   const cwd = join(f.root, 'workspace-summary-repair')
   const scope = f.store.scope(cwd)
   await f.store.ensure(scope)
   await f.store.writeEntries(scope, [{ id: 'repair-entry', content: '启动扫描应恢复这条事实。', status: 'active' }])
-  const metadata = await f.store.repairSummary(scope, 2000, 2)
-  assert.equal(metadata.mode, 'deterministic')
-  assert.match(await f.store.readSummary(scope), /启动扫描应恢复这条事实/u)
+  const repair = await f.store.repairSummary(scope, 86_400_000)
+  assert.equal(repair.needsRefresh, true)
+  assert.equal(await f.store.readSummary(scope), '')
 })
 
 test('does not rebuild a summary for successful checkpoints without memory mutations', async () => {
@@ -441,8 +488,7 @@ test('merges global and workspace memories while preserving field-aware ranking'
   const context = await f.engine.recall({ cwd, query: 'TS 项目语言' })
   assert.equal(context.matches[0]?.title, '项目语言')
   assert.ok(context.matches.some(match => match.title === '语言偏好'))
-  assert.match(context.summary, /全局记忆/u)
-  assert.match(context.summary, /项目记忆/u)
+  assert.equal(context.summary, '')
 })
 
 test('lists persisted scopes and reads an unused scope without creating it', async () => {
@@ -470,7 +516,7 @@ test('archives a workspace scope and permanently purges it on request', async ()
   assert.deepEqual(await f.store.listScopes(), [f.store.scope('')])
   const archived = await f.store.listArchivedScopes()
   assert.equal(archived[0]?.key, scope.key)
-  assert.match((await f.store.readArchivedSnapshot(scope)).summary, /项目记忆/u)
+  assert.equal((await f.store.readArchivedSnapshot(scope)).entries[0]?.content, '可恢复的项目记忆。')
   assert.equal(await f.store.purgeArchivedScope(scope), true)
   assert.equal((await f.store.listArchivedScopes()).length, 0)
 })
@@ -532,7 +578,7 @@ test('budgets matches after truncating the combined summaries', async () => {
   }
   await f.engine.remember({ cwd, content: '预算测试目标记忆：项目使用 TypeScript。', title: '预算测试目标', importance: 3 })
   const context = await f.engine.recall({ cwd, query: '预算测试目标 TypeScript', maxBytes: 1500 })
-  assert.equal(context.summary.length > 0, true)
+  assert.equal(context.summary, '')
   assert.equal(context.matches[0]?.title, '预算测试目标')
 })
 
@@ -548,7 +594,7 @@ test('revises a near-duplicate with shorter content and retains the previous ver
   assert.equal(entries[0]?.revisions?.[0]?.content, '项目使用 PostgreSQL 数据库。')
 })
 
-test('manually edits and deletes a memory while rebuilding recall and summary', async () => {
+test('manually edits and deletes a memory while invalidating stale semantic content', async () => {
   const f = await fixture()
   onTestFinished(f.cleanup)
   const cwd = join(f.root, 'workspace-manual-edit')
@@ -574,7 +620,7 @@ test('manually edits and deletes a memory while rebuilding recall and summary', 
   assert.equal(edited?.provenance?.reason, 'manual')
   const recalled = await f.engine.recall({ cwd, query: 'PostgreSQL' })
   assert.equal(recalled.matches[0]?.content, '项目数据库使用 PostgreSQL。')
-  assert.match(recalled.summary, /数据库选型/u)
+  assert.equal(recalled.summary, '')
   assert.doesNotMatch(recalled.summary, /MySQL/u)
 
   const deleted = await f.engine.forget({ cwd, id })
@@ -636,7 +682,7 @@ test('supersedes an explicitly corrected memory and immediately removes it from 
   assert.equal(entries.find(entry => entry.content.includes('MySQL'))?.status, 'superseded')
   assert.equal(entries.find(entry => entry.content.includes('PostgreSQL'))?.status, 'active')
   assert.doesNotMatch(await f.store.readSummary(scope), /MySQL/u)
-  assert.match(await f.store.readSummary(scope), /PostgreSQL/u)
+  assert.equal(await f.store.readSummary(scope), '')
   assert.equal((await f.engine.recall({ cwd, query: 'MySQL 数据库' })).matches.some(match => match.content.includes('MySQL')), false)
 })
 
@@ -789,7 +835,7 @@ test('routes a workspace correction to global memory and rebuilds the global sum
   const global = f.store.scope('')
   const entries = await f.store.readEntries(global)
   assert.equal(entries.find(entry => entry.content.includes('需要创建'))?.status, 'superseded')
-  assert.match(await f.store.readSummary(global), /不要创建文件/u)
+  assert.equal(await f.store.readSummary(global), '')
   assert.doesNotMatch(await f.store.readSummary(global), /需要创建文件/u)
 })
 

@@ -27,36 +27,33 @@
 ```text
 workspace-memory/
 ├── global/
-│   ├── memory_summary.md
-│   ├── summary_meta.json
 │   ├── memory_entries.json
+│   ├── representation_meta.json
+│   ├── representations/generations/<generation-id>/
+│   │   ├── memory_index.md
+│   │   ├── memory_summary.md
+│   │   └── topics/*.md
 │   ├── state.json
 │   ├── checkpoints/
-│   └── summary_history/
+│   └── (旧版 memory_summary.md / summary_meta.json / summary_history/)
 ├── scopes/
 │   └── ws-<sha256-prefix>/
 │       ├── scope.json
-│       ├── memory_summary.md
-│       ├── summary_meta.json
 │       ├── memory_entries.json
+│       ├── representation_meta.json
+│       ├── representations/generations/<generation-id>/...
 │       ├── state.json
 │       ├── checkpoints/
-│       └── summary_history/
+│       └── (旧版摘要文件，仅用于迁移)
 └── archived/
-    └── ws-<sha256-prefix>/
-        ├── scope.json
-        ├── memory_summary.md
-        ├── summary_meta.json
-        ├── memory_entries.json
-        ├── state.json
-        ├── checkpoints/
-        └── summary_history/
+    └── ws-<sha256-prefix>/  # 保留整个 scope 目录及其 generation
 ```
 
-`memory_entries.json` 是结构化事实的来源；`memory_summary.md` 是受大小限制的当前注入
-摘要；`summary_meta.json` 保存来源指纹、确定性/语义模式及语义摘要冷却时间；`state.json`
-保存 checkpoint 缓冲和计数；`checkpoints/` 与 `summary_history/`
-用于故障排查和变更审计。所有写入经过 scope 级串行队列，并使用临时文件原子替换。
+`memory_entries.json` 是结构化事实的唯一来源。`representation_meta.json` 是当前已发布 generation 的
+原子指针，记录每个主题的来源指纹和 entry ID；`representations/generations/` 保存不可变的模型语义
+主题页、组合摘要和轻量索引。旧版摘要文件只用于兼容迁移，不再作为新 generation 的发布路径。
+`state.json` 保存 checkpoint 缓冲和计数；`checkpoints/` 用于故障排查和变更审计。所有写入经过
+scope 级串行队列，并使用临时文件原子替换。
 
 ## 4. 公共接口
 
@@ -84,11 +81,12 @@ Agent 显式写入、更新和删除时必须携带 `global | workspace` scope�
 
 ### Agent
 
-1. `systemPrompt.context` 注入当前 scope 的稳定摘要。
+1. `systemPrompt.context` 注入 global 与当前 scope 的轻量记忆索引。
 2. Agent 第一个 step 根据用户消息调用 `recall`，追加相关条目。
-3. Agent turn 结束时把完整消息交给 checkpoint 缓冲区，响应不会被蒸馏过程阻塞。checkpoint
+3. Agent 需要某个主题的更完整语义内容时，通过 `memory_read_topic` 按需读取已验证的主题页。
+4. Agent turn 结束时把完整消息交给 checkpoint 缓冲区，响应不会被蒸馏过程阻塞。checkpoint
    只在短暂持锁时认领消息和提交结果，耗时的模型蒸馏在锁外执行；期间新到达的消息继续留在缓冲区。
-4. 达到阶段条件后，蒸馏器提取长期有效事实并更新结构化条目。
+5. 达到阶段条件后，蒸馏器提取长期有效事实并更新结构化条目。
 
 ### 普通 Session 与后台 Agent
 
@@ -106,10 +104,11 @@ Agent 显式写入、更新和删除时必须携带 `global | workspace` scope�
 - 默认空闲 5 分钟；
 - Session 关闭，或调用方显式强制 checkpoint。
 
-每轮只追加到缓冲区，不强制调用模型。任何记忆变更都会立即重建不调用模型的确定性摘要，避免已纠正
-事实继续注入。后台语义摘要仅处理 dirty scope，等待默认 60 秒安静窗口，并限制为每个 scope
-最多 24 小时一次；输入按类型轮询且限制为 24 KB，模型只返回 Markdown 摘要正文，程序记录本次
-实际输入的来源 ID，并在提交前再次校验 active 条目指纹。启动时校验来源指纹并恢复到期任务。
+每轮只追加到缓冲区，不强制调用模型。结构化记忆按用户画像、偏好、项目概览、架构、决策、规范与规则、
+修复经验等固定主题分类。任何记忆变更都会立即使受影响主题退出发布，但不会覆盖未受影响的模型主题，
+也不会生成确定性条目拼接。后台等待默认 60 秒安静窗口，只把 dirty topic 的有界来源交给模型；
+模型结果先写入不可变候选 generation，程序再次校验 active 条目及逐主题来源指纹，全部通过后原子切换
+`representation_meta.json`。默认 24 小时只用于无变化时的完整一致性校准，不限制事件驱动的局部更新。
 蒸馏器只用用户原话检索现有记忆，不使用助手回复扩大查询，也不补入最近条目；候选最多 6 条/3 KB。
 蒸馏器输出版本化操作：新增、修订、明确取代或
 标记冲突。明确取代必须引用本次用户消息原文及目标记忆原文；证据不足时保留双方并建立冲突组。
@@ -133,7 +132,7 @@ Web 设置的“记忆”页面从全局 scope 列表中选择任意项目，而
 “永久删除”需确认，并物理删除归档目录及其 checkpoint、摘要历史，操作不可恢复。
 
 前端通过 Host 路由访问脱敏数据，不能直接读写存储文件，也不会展示完整 checkpoint 原文。
-单条编辑和删除必须经过记忆引擎，以保留旧版本、执行敏感信息检查、串行写入并立即重建摘要。
+单条编辑和删除必须经过记忆引擎，以保留旧版本、执行敏感信息检查、串行写入并立即失效受影响主题。
 全局记忆不随项目删除而改变。
 
 ## 9. 安全与降级

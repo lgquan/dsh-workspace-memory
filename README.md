@@ -126,9 +126,10 @@ dsh plugin --profile web remove --config.minimumReleaseAge=0 @flowingspring/dsh-
 
 ## 记忆如何检索和纠错
 
-- 每个 Agent step 都会注入一份有大小上限的稳定摘要；
+- Agent 常驻上下文只注入一份有大小上限的全局及当前工作区记忆索引；
 - Agent 第一个 step 会根据当前问题检索相关结构化记忆；
 - Agent 还可以调用 `memory_search` 搜索 global 和当前工作区的条目；
+- Agent 可以根据索引调用 `memory_read_topic`，按需读取用户画像、项目概览、架构、决策、规范或修复经验等语义主题；
 - `memory_remember` 可以显式保存一条新事实，并且必须选择 `global` 或 `workspace`；
 - `memory_update` 可以使用搜索结果中的记忆 ID 和 scope 修订已有事实；
 - `memory_forget` 可以使用记忆 ID 和 scope 软删除条目。
@@ -139,7 +140,7 @@ dsh plugin --profile web remove --config.minimumReleaseAge=0 @flowingspring/dsh-
 
 明确的用户纠正可以取代旧事实；证据不足的矛盾不会静默覆盖，而会保留为显式冲突。修订前的内容和被取代条目继续保留用于审计，但不会作为有效事实进入稳定摘要。
 
-在设置页展开一条活动记忆后，可以直接编辑标题、说明、内容、标签、类型和重要度，也可以删除该条记忆。手工编辑会保存旧版本并立即重建摘要；删除采用可审计的软删除，该条目会立即退出召回和摘要。
+在设置页展开一条活动记忆后，可以直接编辑标题、说明、内容、标签、类型和重要度，也可以删除该条记忆。手工编辑会保存旧版本，并立即使包含旧内容的语义主题退出注入；删除采用可审计的软删除，该条目会立即退出召回。后台模型在短暂安静窗口后只重建受影响主题，校验通过后原子发布新 generation。
 
 ## 数据存在哪里
 
@@ -186,7 +187,9 @@ $DSH_HOME/workspace-memory
 
 `summarizeProvider` 和 `summarizeModel` 默认固定为 DSH 账户的 Flash 模型，也可以直接在设置页选择其他当前可用模型。
 
-结构化记忆变更后会立即生成不调用模型的可靠摘要；后台语义摘要默认等待 60 秒，并且同一范围最多每 24 小时调用一次所选记忆模型。`semanticSummaryDelayMs` 控制安静窗口，`semanticSummaryIntervalMs` 控制最短调用间隔。DSH 启动只修复缺失或陈旧摘要，并续接已经到期的语义摘要任务。
+结构化记忆是唯一权威事实源。模型生成的语义内容按固定主题保存，常驻上下文只发布轻量索引；结构化条目变化后，受影响主题立即失效，后台默认等待 60 秒安静窗口再增量重建。模型先写入独立候选 generation，程序校验来源指纹仍有效后才原子晋升，失败时不会发布确定性条目拼接。
+
+`semanticSummaryDelayMs` 控制条目变化后的安静窗口；`semanticSummaryIntervalMs` 控制无变化时完整一致性校准的最长间隔，默认 24 小时，不会阻止新增、修订或删除后的局部更新。DSH 启动只恢复 dirty 主题和到期校准任务。
 
 记忆整理不会继承聊天 Session 的思考设置。插件会按所选模型的能力自动使用最低推理档：支持 `off` 时关闭思考，只提供非关闭档位时选择最低档，不支持推理控制时不发送该参数。
 

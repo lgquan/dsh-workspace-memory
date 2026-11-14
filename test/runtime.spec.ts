@@ -89,11 +89,11 @@ class HybridMemoryAdapter extends LlmAdapter {
     this.requests.push(options)
     const requestText = options.messages.flatMap(message => message.content)
       .flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
-    if (requestText.includes('<active_memories>')) {
+    if (requestText.includes('<dirty_topics>')) {
       yield {
         type: 'text-delta',
         index: 0,
-        text: '- 用户画像：现居上海。',
+        text: '{"topics":[{"id":"project-overview","content":"用户画像：现居上海。"}]}',
       }
       yield { type: 'usage', usage: { inputTokens: 200, outputTokens: 40, totalTokens: 240 } }
       yield { type: 'finish', reason: { kind: 'stop' } }
@@ -285,13 +285,14 @@ test('Cordis adapter distils, stores, recalls, and registers explicit tools', as
 
   const recalled = await memory.recall({ sessionId: session.id, query: 'Voco 可选接口' })
   assert.equal(recalled.matches[0]?.content, 'Voco 前台通过可选 workspaceMemory 接口读取长期记忆。')
-  assert.match(recalled.summary, /workspaceMemory/u)
+  assert.equal(recalled.summary, '')
   const agent = { session } as Agent
   const assembly = await ctx.systemPrompt.assemble({ agent, scope: agent })
-  assert.match(assembly.contexts.find(item => item.name === 'workspace-memory-summary')?.text ?? '', /workspaceMemory/u)
+  assert.equal(assembly.contexts.find(item => item.name === 'workspace-memory-summary')?.text ?? '', '')
   await ctx.plugin(ToolRuntime)
   await flushAsyncWork()
   assert.ok(ctx.tools.get('memory_search'))
+  assert.ok(ctx.tools.get('memory_read_topic'))
   assert.ok(ctx.tools.get('memory_remember'))
   assert.ok(ctx.tools.get('memory_forget'))
 })
@@ -366,7 +367,7 @@ test('Agent tools revise a global user profile without creating a workspace dupl
   assert.deepEqual(await store.readEntries(store.scope(workspace)), [])
 })
 
-test('builds a validated semantic summary without requiring model JSON or copied source IDs', async () => {
+test('builds validated semantic topic pages without asking the model to copy source IDs', async () => {
   const memoryDir = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-semantic-runtime-'))
   const workspace = join(memoryDir, 'project')
   const ctx = new Context()
@@ -401,13 +402,12 @@ test('builds a validated semantic summary without requiring model JSON or copied
   const store = new WorkspaceMemoryStore(memoryDir)
   const scope = store.scope(workspace)
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    if ((await store.readSummaryMetadata(scope))?.mode === 'semantic') break
+    if (await store.readRepresentationManifest(scope)) break
     await new Promise(resolve => setTimeout(resolve, 10))
   }
   assert.equal(adapter.requests.length, 2)
-  const metadata = await store.readSummaryMetadata(scope)
-  assert.equal(metadata?.mode, 'semantic')
-  assert.equal(metadata?.sourceIds?.length, 1)
+  const metadata = await store.readRepresentationManifest(scope)
+  assert.equal(metadata?.topics['project-overview']?.sourceIds.length, 1)
   assert.match(await store.readSummary(scope), /用户画像：现居上海/u)
   const state = await store.readState(scope)
   assert.equal(state.distillation.calls, 2)
@@ -451,7 +451,8 @@ test('recovers an overdue pending scope when the runtime starts', async () => {
   await flushAsyncWork()
   assert.equal((await seedStore.readState(scope)).pendingMessages.length, 0)
   const recovered = await memory.recall({ sessionId: session.id, query: 'Voco 可选接口' })
-  assert.match(recovered.summary, /workspaceMemory/u)
+  assert.equal(recovered.matches[0]?.content, 'Voco 前台通过可选 workspaceMemory 接口读取长期记忆。')
+  assert.equal(recovered.summary, '')
 })
 
 test('retries one invalid JSON response inside the same checkpoint', async () => {
@@ -927,7 +928,15 @@ test('browser API exposes Host workspace titles and the routable model catalog',
     importance: 2,
     status: 'active',
   }])
-  await store.rebuildSummary(scope, await store.readEntries(scope), 3000)
+  const prepared = await store.prepareSemanticSummary(scope, 0)
+  assert.equal(prepared.status, 'ready')
+  if (prepared.status !== 'ready') throw new Error('browser seed representation was not ready')
+  assert.equal(await store.commitSemanticSummary(
+    scope,
+    prepared,
+    [{ id: 'architecture', content: '项目数据库使用 MySQL。', sourceIds: ['manual-entry'] }],
+    3000,
+  ), true)
   const ctx = new Context()
   onTestFinished(async () => {
     await ctx.fiber.dispose()
@@ -1006,7 +1015,7 @@ test('browser API exposes Host workspace titles and the routable model catalog',
   assert.equal(editedEntry?.content, '项目使用 PostgreSQL。')
   assert.equal(editedEntry?.revisions?.[0]?.content, '项目使用 MySQL。')
   const editedSnapshot = await new WorkspaceMemoryStore(memoryDir).readSnapshot(scope)
-  assert.match(editedSnapshot.summary, /数据库选型/u)
+  assert.equal(editedSnapshot.summary, '')
   assert.doesNotMatch(editedSnapshot.summary, /MySQL/u)
 
   const deleteResponse = await requestJson(entryHandler, entryUrl, 'DELETE')

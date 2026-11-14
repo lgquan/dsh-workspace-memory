@@ -37,30 +37,24 @@ Default root: `$DSH_HOME/workspace-memory` (fallback `~/.dsh/workspace-memory`).
 ```text
 workspace-memory/
   global/
-    memory_summary.md
-    summary_meta.json
     memory_entries.json
+    representation_meta.json
+    representations/generations/<generation-id>/
+      memory_index.md
+      memory_summary.md
+      topics/*.md
     state.json
     checkpoints/
-    summary_history/
   scopes/
     ws-<sha256-prefix>/
       scope.json
-      memory_summary.md
-      summary_meta.json
       memory_entries.json
+      representation_meta.json
+      representations/generations/<generation-id>/...
       state.json
       checkpoints/
-      summary_history/
   archived/
-    ws-<sha256-prefix>/
-      scope.json
-      memory_summary.md
-      summary_meta.json
-      memory_entries.json
-      state.json
-      checkpoints/
-      summary_history/
+    ws-<sha256-prefix>/  # whole scope, including generations
 ```
 
 Workspace identity is the normalized absolute `cwd`. Runtime data stays out of
@@ -124,24 +118,24 @@ remain visible as a conflict group instead of silently disabling either fact.
 Revisions and superseded entries remain auditable, while only active facts enter
 the stable summary. Legacy proposal arrays remain compatible as add operations.
 
-Any memory mutation immediately rebuilds a deterministic affected-scope summary
-so corrected facts cannot remain injected. `summary_meta.json` fingerprints the
-active entries and distinguishes this reliable fallback from a model-generated
-semantic summary. Semantic summarization runs only for dirty scopes, waits for a
-quiet window, and is rate-limited to once per 24 hours per scope. Its source is
-type-balanced and capped at 24 KB. The model returns only bounded Markdown;
-the runtime records the actual bounded input IDs and verifies that they still
-refer to active entries with the same fingerprint before commit. Startup repairs
-stale derived files and resumes due work. A bounded history is kept before replacement.
+Structured entries are the only authoritative facts. The representation module
+classifies active entries into a fixed set of semantic topics and publishes a
+small index plus topic pages. A mutation immediately invalidates only topics
+whose source hash changed; unchanged topics remain available, while stale topics
+cannot be injected. The runtime waits for a quiet window, generates only dirty
+topics into an immutable candidate generation, validates the complete source and
+per-topic hashes, then atomically promotes `representation_meta.json`. A model
+failure never publishes raw deterministic concatenation. The 24-hour interval is
+only a full consistency refresh cadence; entry changes bypass it.
 
 ## DSH integration
 
-- `systemPrompt.context` injects the stable summary on every Agent step.
+- `systemPrompt.context` injects a small global/current-workspace topic index.
 - `agent/pre-step` calls `recall` for the current user message and appends only
   relevant entries on step 1.
 - `agent/turn-stopping` persists the completed turn without invoking the LLM in
   the foreground path, then schedules it through the short debounce window.
-- memory tools provide explicit search, remember, and forget operations.
+- memory tools provide explicit search, topic reading, remember, update, and forget operations.
 - `memory_search` remains the Agentic second-search seam: an Agent can issue
   alternate queries when the automatic first recall is insufficient.
 

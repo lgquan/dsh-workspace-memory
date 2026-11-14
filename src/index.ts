@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -27,7 +27,9 @@ import type { AssembleContext, SystemPrompt } from '@deepseek-ai/dsh-system-prom
 import { defineTool, type ToolRuntime } from '@deepseek-ai/dsh-tools'
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace'
 import {
+  ENTRIES_FILE,
   SUMMARY_FILE,
+  SUMMARY_META_FILE,
   MemoryDistillationError,
   WorkspaceMemoryEngine,
   WorkspaceMemoryStore,
@@ -49,7 +51,16 @@ import {
   type UpdateInput,
   type WorkspaceMemory,
   type WorkspaceScope,
+  summarySourceHash,
 } from './core.js'
+import {
+  MEMORY_TOPICS,
+  REPRESENTATION_META_FILE,
+  readRepresentationIndexSync,
+  type GeneratedTopic,
+  type MemoryTopicId,
+  type TopicSource,
+} from './representations.js'
 
 export const name = 'workspace-memory'
 
@@ -243,31 +254,21 @@ function parseDistillation(value: unknown): unknown {
   return parsed
 }
 
-interface SemanticSummaryOutput {
-  summary: string
-}
-
-interface SemanticSummaryResult extends SemanticSummaryOutput {
-  sourceIds: string[]
-}
-
-function parseSemanticSummary(value: unknown): SemanticSummaryOutput {
-  const text = String(value ?? '').trim()
-    .replace(/^```(?:markdown|md|json)?\s*/iu, '')
-    .replace(/\s*```$/u, '')
-    .trim()
-  if (text.startsWith('{')) {
-    try {
-      const parsed: unknown = JSON.parse(text)
-      if (isRecord(parsed) && typeof parsed.summary === 'string' && parsed.summary.trim() !== '') {
-        return { summary: parsed.summary.trim() }
-      }
-    } catch {
-      // The current contract is Markdown; malformed legacy JSON remains invalid.
+function parseSemanticTopics(value: unknown, expected: readonly MemoryTopicId[]): GeneratedTopic[] {
+  const parsed: unknown = JSON.parse(normalizeJsonOutput(value))
+  if (!isRecord(parsed) || !Array.isArray(parsed.topics)) throw new Error('semantic memory organizer returned an invalid object')
+  const expectedIds = new Set(expected)
+  const topics: GeneratedTopic[] = []
+  for (const topic of parsed.topics) {
+    if (!isRecord(topic) || typeof topic.id !== 'string' || !expectedIds.has(topic.id as MemoryTopicId)
+      || typeof topic.content !== 'string' || topic.content.trim() === '') {
+      throw new Error('semantic memory organizer returned an invalid topic')
     }
+    if (topics.some(candidate => candidate.id === topic.id)) throw new Error('semantic memory organizer returned a duplicate topic')
+    topics.push({ id: topic.id as MemoryTopicId, content: topic.content.trim(), sourceIds: [] })
   }
-  if (text === '' || text.startsWith('{')) throw new Error('semantic memory summarizer returned an empty or invalid summary')
-  return { summary: text }
+  if (topics.length !== expectedIds.size) throw new Error('semantic memory organizer omitted a requested topic')
+  return topics
 }
 
 function distillationOperations(value: unknown): unknown[] {
@@ -409,6 +410,28 @@ async function readJsonBody(request: IncomingMessage, maxBytes = 16_384): Promis
 
 function readSummaryFile(file: string): string {
   try { return readFileSync(file, 'utf8') } catch { return '' }
+}
+
+function readMemoryEntriesFile(scope: WorkspaceScope): MemoryEntry[] {
+  try {
+    const value: unknown = JSON.parse(readFileSync(join(scope.dir, ENTRIES_FILE), 'utf8'))
+    return Array.isArray(value) ? value.filter((entry): entry is MemoryEntry => isRecord(entry) && typeof entry.id === 'string' && typeof entry.content === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+function readPublishedMemoryIndex(scope: WorkspaceScope, maxBytes: number): string {
+  const entries = readMemoryEntriesFile(scope)
+  const index = readRepresentationIndexSync(scope.dir, scope.key, entries, maxBytes)
+  if (existsSync(join(scope.dir, REPRESENTATION_META_FILE))) return index
+  try {
+    const metadata: unknown = JSON.parse(readFileSync(join(scope.dir, SUMMARY_META_FILE), 'utf8'))
+    if (isRecord(metadata) && metadata.mode === 'semantic' && metadata.sourceHash === summarySourceHash(entries)) {
+      return truncateUtf8(readSummaryFile(join(scope.dir, SUMMARY_FILE)), maxBytes)
+    }
+  } catch {}
+  return ''
 }
 
 function sessionFromScope(scope: unknown): { header: { cwd?: string } } | undefined {
@@ -764,8 +787,9 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
   private async recoverSummaries(): Promise<void> {
     try {
       for (const scope of await this.store.listScopes()) {
-        const metadata = await this.store.repairSummary(scope, this.settings.summaryMaxBytes, this.settings.keepSummaryVersions)
-        if (metadata.mode === 'deterministic') this.scheduleSemanticSummary(scope)
+        const repair = await this.store.repairSummary(scope, this.settings.semanticSummaryIntervalMs)
+        if (repair.needsRefresh) this.scheduleSemanticSummary(scope)
+        else if (repair.nextRefreshAt !== undefined) this.scheduleSemanticSummary(scope, Math.max(10, repair.nextRefreshAt - Date.now()))
       }
     } catch (error) {
       this.ctx.logger.warn('workspace-memory summary recovery failed: %o', error)
@@ -795,56 +819,48 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
       const preparation = await this.store.prepareSemanticSummary(
         scope,
         this.settings.semanticSummaryIntervalMs,
-        this.settings.summaryMaxBytes,
-        this.settings.keepSummaryVersions,
       )
       if (preparation.status === 'clean') return
-      if (preparation.status === 'wait') {
-        this.scheduleSemanticSummary(scope, Math.max(10, preparation.dueAt - Date.now()))
-        return
-      }
-      const generated = await this.runSemanticSummaryCall(scope, preparation.entries)
+      const requestedTopics = preparation.dirtyTopics.filter(topic => topic.entries.length > 0)
+      const generated = requestedTopics.length === 0 ? [] : await this.runSemanticSummaryCall(scope, requestedTopics)
       const committed = await this.store.commitSemanticSummary(
         scope,
-        preparation.sourceHash,
-        generated.summary,
-        generated.sourceIds,
+        preparation,
+        generated,
         this.settings.summaryMaxBytes,
         this.settings.keepSummaryVersions,
       )
-      if (!committed) this.scheduleSemanticSummary(scope)
+      if (!committed) {
+        this.scheduleSemanticSummary(scope)
+      } else {
+        const manifest = await this.store.readRepresentationManifest(scope)
+        const dueAt = (manifest?.fullRefreshAt ?? Date.now()) + this.settings.semanticSummaryIntervalMs
+        this.scheduleSemanticSummary(scope, Math.max(10, dueAt - Date.now()))
+      }
     } catch (error) {
       this.ctx.logger.warn('workspace-memory semantic summary failed for scope=%s: %o', scope.key, error)
-      this.scheduleSemanticSummary(scope, this.settings.semanticSummaryIntervalMs)
+      this.scheduleSemanticSummary(scope, Math.max(60_000, this.settings.semanticSummaryDelayMs))
     } finally {
       this.activeDistillations -= 1
       this.drainCheckpointQueue()
     }
   }
 
-  private async runSemanticSummaryCall(scope: WorkspaceScope, entries: readonly MemoryEntry[]): Promise<SemanticSummaryResult> {
+  private async runSemanticSummaryCall(scope: WorkspaceScope, topics: readonly TopicSource[]): Promise<GeneratedTopic[]> {
     const llm = this.ctx.get('llm')
     if (llm === undefined) throw new Error('no LLM runtime is available for semantic memory summary')
     const summarizeProvider = currentString(this.settings.summarizeProvider) || DEFAULTS.summarizeProvider
     const summarizeModel = currentString(this.settings.summarizeModel) || DEFAULTS.summarizeModel
-    const groups = new Map<string, MemoryEntry[]>()
-    for (const entry of entries) {
-      const key = entry.type ?? 'fact'
-      const group = groups.get(key) ?? []
-      group.push(entry)
-      groups.set(key, group)
-    }
-    for (const group of groups.values()) {
-      group.sort((left, right) => Number(right.importance ?? 1) - Number(left.importance ?? 1)
-        || String(right.updatedAt).localeCompare(String(left.updatedAt)))
-    }
-    const source: Array<Record<string, unknown>> = []
-    const groupKeys = [...groups.keys()].sort()
+    const source: Array<{ id: MemoryTopicId; title: string; memories: Array<Record<string, unknown>> }> = topics.map(topic => ({
+      id: topic.id,
+      title: topic.title,
+      memories: [],
+    }))
     let sourceBytes = 2
     for (let offset = 0; ; offset += 1) {
       let added = false
-      for (const key of groupKeys) {
-        const entry = groups.get(key)?.[offset]
+      for (const topic of topics) {
+        const entry = topic.entries[offset]
         if (entry === undefined) continue
         const projected = {
           id: entry.id,
@@ -858,74 +874,80 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
         }
         const bytes = Buffer.byteLength(JSON.stringify(projected)) + 1
         if (sourceBytes + bytes > 24_000) continue
-        source.push(projected)
+        source.find(candidate => candidate.id === topic.id)?.memories.push(projected)
         sourceBytes += bytes
         added = true
       }
       if (!added) break
     }
-    const request = createUserMessage({
-      content: [{
-        type: 'text',
-        text: [
-          '将下面的 active 结构化长期记忆压缩成覆盖均衡的中文摘要。',
-          '按用户画像、项目事实、决策、规则和修复组织；合并重复内容，保留适用条件，不添加来源中不存在的事实。',
-          '摘要控制在约 450 个汉字以内。只输出 Markdown 摘要正文，不要输出 JSON、代码围栏或解释。',
-          '',
-          '<active_memories>',
-          JSON.stringify(source),
-          '</active_memories>',
-        ].join('\n'),
-      }],
-      source: { kind: 'workspace-memory' },
-    })
-    let output = ''
-    let usage: TokenUsage | undefined
-    let finishReason = 'error'
-    try {
-      const prepared = await llm.prepareCall({ provider: summarizeProvider, model: summarizeModel }, undefined, (controls, modelInfo) => {
-        const efforts = modelInfo.reasoning?.efforts
-        const effort = efforts?.find(candidate => candidate.id === 'off') ?? efforts?.[0]
-        return effort === undefined ? { ...controls } : { ...controls, reasoningEffort: effort.id }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const request = createUserMessage({
+        content: [{
+          type: 'text',
+          text: [
+            '将下面按主题分组的 active 结构化长期记忆整理成对应的中文主题知识页。',
+            '每个请求主题必须输出一项；合并重复内容，保留适用条件，不添加来源中不存在的事实。每个主题控制在约 250 个汉字以内。',
+            '只输出一行 JSON：{"topics":[{"id":"project-overview","content":"Markdown 正文"}]}。id 必须与输入主题完全一致，不要输出代码围栏或解释。',
+            ...(attempt === 0 ? [] : ['', '上一次输出不是有效的主题 JSON。重新输出完整的一行 JSON，不要添加解释。']),
+            '',
+            '<dirty_topics>',
+            JSON.stringify(source),
+            '</dirty_topics>',
+          ].join('\n'),
+        }],
+        source: { kind: 'workspace-memory' },
       })
-      for await (const chunk of prepared.stream({
-        ...prepared.config,
-        messages: [request],
-        system: '你是长期记忆语义摘要器。输入条目是唯一事实来源；只输出简洁的 Markdown 摘要正文。',
-      })) {
-        if (chunk.type === 'text-delta') output += chunk.text
-        if (chunk.type === 'usage') usage = chunk.usage
-        if (chunk.type !== 'finish') continue
-        finishReason = chunk.reason.kind
-        if (chunk.reason.kind === 'max-tokens') throw new MemoryDistillationError('semantic memory summary reached the model output limit', 'max-tokens', false)
-        if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
-          if (chunk.reason.kind === 'aborted') throw new MemoryDistillationError(chunk.reason.failure.message, 'aborted', true)
-          throw providerDistillationError(chunk.reason.failure)
-        }
-      }
-      let parsed: SemanticSummaryOutput
+      let output = ''
+      let usage: TokenUsage | undefined
+      let finishReason = 'error'
       try {
-        parsed = parseSemanticSummary(output)
+        const prepared = await llm.prepareCall({ provider: summarizeProvider, model: summarizeModel }, undefined, (controls, modelInfo) => {
+          const efforts = modelInfo.reasoning?.efforts
+          const effort = efforts?.find(candidate => candidate.id === 'off') ?? efforts?.[0]
+          return effort === undefined ? { ...controls } : { ...controls, reasoningEffort: effort.id }
+        })
+        for await (const chunk of prepared.stream({
+          ...prepared.config,
+          messages: [request],
+          system: '你是长期记忆主题整理器。输入条目是唯一事实来源；严格按要求输出主题 JSON。',
+        })) {
+          if (chunk.type === 'text-delta') output += chunk.text
+          if (chunk.type === 'usage') usage = chunk.usage
+          if (chunk.type !== 'finish') continue
+          finishReason = chunk.reason.kind
+          if (chunk.reason.kind === 'max-tokens') throw new MemoryDistillationError('semantic memory summary reached the model output limit', 'max-tokens', false)
+          if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
+            if (chunk.reason.kind === 'aborted') throw new MemoryDistillationError(chunk.reason.failure.message, 'aborted', true)
+            throw providerDistillationError(chunk.reason.failure)
+          }
+        }
+        let parsed: GeneratedTopic[]
+        try {
+          parsed = parseSemanticTopics(output, topics.map(topic => topic.id))
+        } catch (error) {
+          this.ctx.logger.warn(
+            'workspace-memory semantic summary parse failed scope=%s outputChars=%d sourceEntries=%d sourceBytes=%d: %s',
+            scope.key,
+            output.length,
+            source.reduce((total, topic) => total + topic.memories.length, 0),
+            sourceBytes,
+            error instanceof Error ? error.message : String(error),
+          )
+          throw new MemoryDistillationError(error instanceof Error ? error.message : String(error), 'invalid-output', false)
+        }
+        await this.recordDistillationCall(scope, usage, finishReason, false)
+        return parsed.map(topic => ({
+          ...topic,
+          sourceIds: source.find(candidate => candidate.id === topic.id)?.memories
+            .map(memory => memory.id).filter((id): id is string => typeof id === 'string') ?? [],
+        }))
       } catch (error) {
-        this.ctx.logger.warn(
-          'workspace-memory semantic summary parse failed scope=%s outputChars=%d sourceEntries=%d sourceBytes=%d: %s',
-          scope.key,
-          output.length,
-          source.length,
-          sourceBytes,
-          error instanceof Error ? error.message : String(error),
-        )
+        await this.recordDistillationCall(scope, usage, finishReason, true)
+        if (attempt === 0 && error instanceof MemoryDistillationError && error.code === 'invalid-output') continue
         throw error
       }
-      await this.recordDistillationCall(scope, usage, finishReason, false)
-      return {
-        ...parsed,
-        sourceIds: source.map(entry => entry.id).filter((id): id is string => typeof id === 'string'),
-      }
-    } catch (error) {
-      await this.recordDistillationCall(scope, usage, finishReason, true)
-      throw error
     }
+    throw new MemoryDistillationError('semantic memory organizer did not return valid topics', 'invalid-output', false)
   }
 
   private async distill({ scope, messages, reason, existingEntries = [] }: DistillInput): Promise<unknown> {
@@ -1169,10 +1191,10 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
             const session = context.agent?.session ?? sessionFromScope(context.scope)
             const scope = this.store.scope(session?.header?.cwd ?? '')
             const global = this.store.scope('')
-            const workspaceSummary = readSummaryFile(join(scope.dir, SUMMARY_FILE))
-            const globalSummary = scope.key === 'global' ? '' : readSummaryFile(join(global.dir, SUMMARY_FILE))
-            const summary = [globalSummary, workspaceSummary].filter(value => value.trim() !== '').join('\n\n')
-            return memoryReference({ summary: redactSecrets(truncateUtf8(summary, this.settings.summaryMaxBytes)), matches: [] })
+            const workspaceIndex = readPublishedMemoryIndex(scope, this.settings.summaryMaxBytes)
+            const globalIndex = scope.key === 'global' ? '' : readPublishedMemoryIndex(global, this.settings.summaryMaxBytes)
+            const index = [globalIndex, workspaceIndex].filter(value => value.trim() !== '').join('\n\n')
+            return memoryReference({ summary: redactSecrets(truncateUtf8(index, this.settings.summaryMaxBytes)), matches: [] })
           } catch {
             return ''
           }
@@ -1259,11 +1281,37 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
           },
           render: (_args, value) => outputText(memoryReference(value) || 'No matching workspace memory.'),
         },
-        execute: (args, exec) => this.recall({
-          ...(exec.agent === undefined ? {} : { sessionId: exec.agent.session.id }),
-          query: args.query,
-          ...(args.limit === undefined ? {} : { limit: args.limit }),
-        }),
+        execute: async (args, exec) => {
+          const result = await this.recall({
+            ...(exec.agent === undefined ? {} : { sessionId: exec.agent.session.id }),
+            query: args.query,
+            ...(args.limit === undefined ? {} : { limit: args.limit }),
+          })
+          return { ...result, summary: '' }
+        },
+      })))
+      disposers.push(tools.register(defineTool({
+        name: 'memory_read_topic',
+        description: 'Read one semantic memory topic listed in the injected memory index. Use this when the topic overview is relevant and entry search alone is not enough.',
+        parameters: {
+          scope: { type: 'string', required: true, enum: ['global', 'workspace'], description: 'Read the global or current-workspace topic.' },
+          topic: { type: 'string', required: true, enum: MEMORY_TOPICS.map(topic => topic.id), description: 'Topic id shown in the memory index.' },
+        },
+        output: {
+          schema: { type: 'object', additionalProperties: false, properties: {
+            scope: { type: 'string', required: true }, topic: { type: 'string', required: true }, content: { type: 'string', required: true },
+          } },
+          render: (_args, value) => outputText(value.content || 'The requested memory topic is unavailable or waiting for refresh.'),
+        },
+        execute: async (args, exec) => {
+          const cwd = await this.resolveCwd(exec.agent === undefined ? {} : { sessionId: exec.agent.session.id })
+          const scope = args.scope === 'global' ? this.store.scope('') : this.store.scope(cwd)
+          return {
+            scope: scope.key,
+            topic: args.topic,
+            content: redactSecrets(await this.store.readTopic(scope, args.topic as MemoryTopicId)),
+          }
+        },
       })))
       disposers.push(tools.register(defineTool({
         name: 'memory_remember',

@@ -1,8 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, normalize, resolve } from 'node:path'
 import type { SessionId } from '@deepseek-ai/dsh-session'
+import {
+  MemoryRepresentations,
+  type GeneratedTopic,
+  type MemoryTopicId,
+  type RepresentationManifest,
+  type RepresentationPreparation,
+} from './representations.js'
 
 export interface MemoryMessage {
   id: string
@@ -200,10 +207,12 @@ export interface SummaryMetadata {
   sourceIds?: string[]
 }
 
-export type SemanticSummaryPreparation =
-  | { status: 'clean' }
-  | { status: 'wait'; dueAt: number }
-  | { status: 'ready'; scope: WorkspaceScope; sourceHash: string; entries: MemoryEntry[] }
+export type SemanticSummaryPreparation = RepresentationPreparation
+
+export interface SummaryRepairResult {
+  needsRefresh: boolean
+  nextRefreshAt?: number
+}
 
 export interface DistillationStats {
   calls: number
@@ -580,21 +589,6 @@ function archivedScopeDirectory(root: string, key: string): string {
   return join(root, ARCHIVE_DIR, key)
 }
 
-function deterministicSummary(entries: readonly MemoryEntry[], maxBytes: number, heading = '# 项目记忆'): string {
-  const active = entries
-    .filter(isSummarizable)
-    .sort((left, right) => Number(right.importance ?? 1) - Number(left.importance ?? 1)
-      || String(right.updatedAt).localeCompare(String(left.updatedAt)))
-  const lines = [heading, '', '由 dsh-workspace-memory 维护的长期事实。', '']
-  for (const entry of active) {
-    const tags = (entry.tags ?? []).length > 0 ? ` [${entry.tags?.join(', ')}]` : ''
-    const candidate = `- ${entry.title ?? entry.content}: ${entry.description ?? entry.content}${tags}`
-    if (Buffer.byteLength([...lines, candidate, ''].join('\n')) > maxBytes) break
-    lines.push(candidate)
-  }
-  return lines.join('\n').trimEnd() + '\n'
-}
-
 function summarySourceEntries(entries: readonly MemoryEntry[]): MemoryEntry[] {
   return entries.filter(isSummarizable).sort((left, right) => left.id.localeCompare(right.id))
 }
@@ -613,21 +607,6 @@ export function summarySourceHash(entries: readonly MemoryEntry[]): string {
     updatedAt: entry.updatedAt,
   }))
   return createHash('sha256').update(JSON.stringify(source)).digest('hex')
-}
-
-function semanticSummaryDocument(scope: WorkspaceScope, summary: string, maxBytes: number): string {
-  const lines = [
-    scope.key === 'global' ? '# 全局记忆' : '# 项目记忆',
-    '',
-    '由 dsh-workspace-memory 根据结构化记忆生成的语义摘要。',
-    '',
-  ]
-  for (const line of summary.trim().split(/\r?\n/u).map(value => value.trim()).filter(Boolean)) {
-    if (Buffer.byteLength([...lines, line, ''].join('\n')) > maxBytes) break
-    lines.push(line)
-  }
-  if (lines.length === 4) throw new Error('semantic memory summary is empty or exceeds the byte budget')
-  return lines.join('\n').trimEnd() + '\n'
 }
 
 function checkpointMarkdown(
@@ -685,11 +664,17 @@ export class WorkspaceMemoryStore {
   private readonly locks = new Map<string, Promise<unknown>>()
   private readonly snapshotCache = new Map<string, MemoryScopeSnapshot>()
   private readonly snapshotGenerations = new Map<string, number>()
+  private readonly representations: MemoryRepresentations
 
   constructor(root: string, options: { now?: () => number; uuid?: () => string } = {}) {
     this.root = resolve(root)
     this.now = options.now ?? (() => Date.now())
     this.uuid = options.uuid ?? randomUUID
+    this.representations = new MemoryRepresentations({
+      now: this.now,
+      uuid: this.uuid,
+      writeAtomic: (file, text) => this.writeAtomic(file, text),
+    })
   }
 
   scope(cwd?: string): WorkspaceScope {
@@ -801,11 +786,30 @@ export class WorkspaceMemoryStore {
   }
 
   async readSummary(scope: WorkspaceScope): Promise<string> {
-    const raw = await readFile(join(scope.dir, SUMMARY_FILE), 'utf8').catch(() => '')
-    return raw
+    const entries = await this.readEntries(scope)
+    const published = await this.representations.read(scope.dir, scope.key, entries, Number.MAX_SAFE_INTEGER)
+    if (published.manifest !== undefined) return published.summary
+    const metadata = await this.readSummaryMetadata(scope)
+    if (metadata?.mode !== 'semantic' || metadata.sourceHash !== summarySourceHash(entries)) return ''
+    const legacy = await readFile(join(scope.dir, SUMMARY_FILE), 'utf8').catch(() => '')
+    return legacy
       .replace(/^# Global memory$/mu, '# 全局记忆')
       .replace(/^# Workspace memory$/mu, '# 项目记忆')
-      .replace(/^Durable reference facts maintained by dsh-workspace-memory\.$/mu, '由 dsh-workspace-memory 维护的长期事实。')
+  }
+
+  async readIndex(scope: WorkspaceScope, maxBytes: number): Promise<string> {
+    const entries = await this.readEntries(scope)
+    const published = await this.representations.read(scope.dir, scope.key, entries, maxBytes)
+    if (published.index !== '') return published.index
+    return truncateUtf8(await this.readSummary(scope), maxBytes)
+  }
+
+  async readTopic(scope: WorkspaceScope, id: MemoryTopicId): Promise<string> {
+    return this.representations.readTopic(scope.dir, scope.key, await this.readEntries(scope), id)
+  }
+
+  async readRepresentationManifest(scope: WorkspaceScope): Promise<RepresentationManifest | undefined> {
+    return this.representations.readManifest(scope.dir)
   }
 
   async readSummaryMetadata(scope: WorkspaceScope): Promise<SummaryMetadata | undefined> {
@@ -933,116 +937,41 @@ export class WorkspaceMemoryStore {
     await this.writeAtomic(join(scope.dir, STATE_FILE), JSON.stringify(state, null, 2) + '\n')
   }
 
-  async rebuildSummary(scope: WorkspaceScope, entries: readonly MemoryEntry[], maxBytes: number, keepHistory = 10): Promise<void> {
-    this.invalidateSnapshot(scope)
-    const previousMetadata = await this.readSummaryMetadata(scope)
-    await this.writeSummaryContent(
-      scope,
-      deterministicSummary(entries, maxBytes, scope.key === 'global' ? '# 全局记忆' : '# 项目记忆'),
-      keepHistory,
-    )
-    await this.writeSummaryMetadata(scope, {
-      version: 1,
-      mode: 'deterministic',
-      sourceHash: summarySourceHash(entries),
-      updatedAt: this.now(),
-      ...(previousMetadata?.semanticLastAttemptAt === undefined ? {} : { semanticLastAttemptAt: previousMetadata.semanticLastAttemptAt }),
-      ...(previousMetadata?.semanticLastSuccessAt === undefined ? {} : { semanticLastSuccessAt: previousMetadata.semanticLastSuccessAt }),
-    })
-  }
-
-  async repairSummary(scope: WorkspaceScope, maxBytes: number, keepHistory = 10): Promise<SummaryMetadata> {
+  async repairSummary(scope: WorkspaceScope, fullRefreshIntervalMs: number): Promise<SummaryRepairResult> {
     return this.withScope(scope, async () => {
       await this.ensure(scope)
       const entries = await this.readEntries(scope)
-      const sourceHash = summarySourceHash(entries)
-      const [summary, metadata] = await Promise.all([this.readSummary(scope), this.readSummaryMetadata(scope)])
-      if (summary.trim() === '' || metadata?.sourceHash !== sourceHash) {
-        await this.rebuildSummary(scope, entries, maxBytes, keepHistory)
-      }
-      return (await this.readSummaryMetadata(scope)) ?? {
-        version: 1,
-        mode: 'deterministic',
-        sourceHash,
-        updatedAt: this.now(),
+      const preparation = await this.representations.prepare(scope.dir, scope.key, entries, fullRefreshIntervalMs)
+      if (preparation.status === 'ready') return { needsRefresh: true }
+      const fullRefreshAt = preparation.manifest?.fullRefreshAt
+      return {
+        needsRefresh: false,
+        ...(fullRefreshAt === undefined ? {} : { nextRefreshAt: fullRefreshAt + Math.max(0, fullRefreshIntervalMs) }),
       }
     })
   }
 
-  async prepareSemanticSummary(scope: WorkspaceScope, minimumIntervalMs: number, maxBytes: number, keepHistory = 10): Promise<SemanticSummaryPreparation> {
+  async prepareSemanticSummary(scope: WorkspaceScope, fullRefreshIntervalMs: number): Promise<SemanticSummaryPreparation> {
     return this.withScope(scope, async () => {
       await this.ensure(scope)
       const entries = await this.readEntries(scope)
-      const sourceHash = summarySourceHash(entries)
-      let metadata = await this.readSummaryMetadata(scope)
-      const summary = await this.readSummary(scope)
-      if (summary.trim() === '' || metadata?.sourceHash !== sourceHash) {
-        await this.rebuildSummary(scope, entries, maxBytes, keepHistory)
-        metadata = await this.readSummaryMetadata(scope)
-      }
-      if (summarySourceEntries(entries).length === 0 || metadata?.mode === 'semantic') return { status: 'clean' }
-      const lastAttemptAt = metadata?.semanticLastAttemptAt ?? 0
-      const dueAt = lastAttemptAt + Math.max(0, minimumIntervalMs)
-      if (dueAt > this.now()) return { status: 'wait', dueAt }
-      await this.writeSummaryMetadata(scope, {
-        version: 1,
-        mode: 'deterministic',
-        sourceHash,
-        updatedAt: metadata?.updatedAt ?? this.now(),
-        semanticLastAttemptAt: this.now(),
-        ...(metadata?.semanticLastSuccessAt === undefined ? {} : { semanticLastSuccessAt: metadata.semanticLastSuccessAt }),
-      })
-      return { status: 'ready', scope, sourceHash, entries: summarySourceEntries(entries) }
+      return this.representations.prepare(scope.dir, scope.key, entries, fullRefreshIntervalMs)
     })
   }
 
   async commitSemanticSummary(
     scope: WorkspaceScope,
-    sourceHash: string,
-    summary: string,
-    sourceIds: readonly string[],
+    preparation: Exclude<SemanticSummaryPreparation, { status: 'clean' }>,
+    topics: readonly GeneratedTopic[],
     maxBytes: number,
     keepHistory = 10,
   ): Promise<boolean> {
     return this.withScope(scope, async () => {
       const entries = await this.readEntries(scope)
-      if (summarySourceHash(entries) !== sourceHash) return false
-      const activeIds = new Set(summarySourceEntries(entries).map(entry => entry.id))
-      const uniqueSourceIds = [...new Set(sourceIds)]
-      if (uniqueSourceIds.length === 0 || uniqueSourceIds.some(id => !activeIds.has(id))) return false
-      const metadata = await this.readSummaryMetadata(scope)
-      const document = semanticSummaryDocument(scope, summary, maxBytes)
       this.invalidateSnapshot(scope)
-      await this.writeSummaryContent(scope, document, keepHistory)
-      await this.writeSummaryMetadata(scope, {
-        version: 1,
-        mode: 'semantic',
-        sourceHash,
-        updatedAt: this.now(),
-        semanticLastAttemptAt: metadata?.semanticLastAttemptAt ?? this.now(),
-        semanticLastSuccessAt: this.now(),
-        sourceIds: uniqueSourceIds,
-      })
-      return true
+      const committed = await this.representations.commit(scope.dir, scope.key, entries, preparation, topics, maxBytes, keepHistory)
+      return committed
     })
-  }
-
-  private async writeSummaryContent(scope: WorkspaceScope, content: string, keepHistory: number): Promise<void> {
-    const file = join(scope.dir, SUMMARY_FILE)
-    const previous = await readFile(file, 'utf8').catch(() => '')
-    if (previous.trim() !== '' && previous !== content) {
-      const history = join(scope.dir, HISTORY_DIR, `${String(this.now())}-${this.uuid()}.md`)
-      await this.writeAtomic(history, previous)
-    }
-    await this.writeAtomic(file, content)
-    const historyFiles = (await readdir(join(scope.dir, HISTORY_DIR)).catch(() => [])).sort().reverse()
-    for (const stale of historyFiles.slice(Math.max(0, keepHistory))) {
-      await unlink(join(scope.dir, HISTORY_DIR, stale)).catch(() => {})
-    }
-  }
-
-  private async writeSummaryMetadata(scope: WorkspaceScope, metadata: SummaryMetadata): Promise<void> {
-    await this.writeAtomic(join(scope.dir, SUMMARY_META_FILE), JSON.stringify(metadata, null, 2) + '\n')
   }
 
   async writeCheckpoint(
@@ -1658,15 +1587,11 @@ export class WorkspaceMemoryEngine {
             const globalEntries = await this.store.readEntries(globalScope)
             const globalMutation = applyOperations(globalEntries, globalOperations, nowIso, this.store.uuid, prepared.staged)
             await this.store.writeEntries(globalScope, globalEntries)
-            if (globalMutation.added + globalMutation.updated > 0 || !(await this.store.readSummary(globalScope)).trim()) {
-              await this.store.rebuildSummary(globalScope, globalEntries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
-            }
             return globalMutation
           })
         }
         if (result.added + result.updated > 0 || !(await this.store.readSummary(scope)).trim()) {
           state.version += 1
-          await this.store.rebuildSummary(scope, entries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
         }
         const combined: MutationResult = {
           added: result.added + globalResult.added,
@@ -1706,7 +1631,6 @@ export class WorkspaceMemoryEngine {
       if (proposal === undefined) throw new Error('memory content is empty or contains a credential-like secret')
       const result = applyOperations(entries, [{ ...proposal, op: 'add' }], new Date(this.store.now()).toISOString(), this.store.uuid)
       await this.store.writeEntries(scope, entries)
-      await this.store.rebuildSummary(scope, entries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
       return { scope: scope.key, added: result.added, updated: result.updated, ignored: result.ignored }
     })
   }
@@ -1755,7 +1679,6 @@ export class WorkspaceMemoryEngine {
         updatedAt: nowIso,
       })
       await this.store.writeEntries(scope, entries)
-      await this.store.rebuildSummary(scope, entries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
       return { scope: scope.key, updated: true }
     })
   }
@@ -1780,7 +1703,6 @@ export class WorkspaceMemoryEngine {
         }
       }
       await this.store.writeEntries(scope, entries)
-      await this.store.rebuildSummary(scope, entries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
       return { scope: scope.key, deleted: true }
     })
   }
