@@ -101,7 +101,7 @@ dsh plugin --profile web remove --config.minimumReleaseAge=0 @flowingspring/dsh-
 
 ## 记忆什么时候整理
 
-普通对话完成后，消息会立即持久化到缓冲区，并在默认 15 秒合并窗口后进入后台整理。短窗口会把同一项目连续产生的消息合并，避免对流式片段或紧邻轮次逐条调用模型。前台回答不等待整理完成。
+普通对话完成后，消息会立即持久化到缓冲区，并在默认 5 秒合并窗口后进入后台整理。短窗口会把同一项目连续产生的消息合并，避免对流式片段或紧邻轮次逐条调用模型。前台回答不等待整理完成。
 
 后台 Agent 任务结束、Session 关闭或调用方显式要求时仍会立即评估 checkpoint。批处理调用方还可以使用以下条件：
 
@@ -112,7 +112,9 @@ dsh plugin --profile web remove --config.minimumReleaseAge=0 @flowingspring/dsh-
 - Session 关闭；
 - 调用方显式要求立即整理。
 
-插件在 DSH 服务运行期间持续处理后台队列，默认全局最多同时发起一个整理请求。它会在服务启动时恢复已有项目的待整理消息，并在最长 15 秒内重新调度。若模型或网络导致一次整理失败，插件会自动使用退避间隔重试，并在成功提交前保留待整理消息。
+插件在 DSH 服务运行期间持续处理后台队列，默认全局最多同时发起一个整理请求。它会在服务启动时恢复已有项目的待整理消息，并在最长 5 秒内重新调度。若模型或网络导致一次整理失败，插件会自动使用退避间隔重试，并在成功提交前保留待整理消息。
+
+同一工作区的新 Session 第一次召回记忆时，如果仍有待整理内容，插件会优先触发整理并最多等待 10 秒。整理超时或失败不会无限阻塞聊天，而是继续使用已有记忆。
 
 因此，刚结束对话后的短暂窗口内只看到“待整理”是正常现象；设置页会同时显示计划、排队、整理和重试状态。DSH 服务停止时不会在独立进程中继续调用模型，重新启动后会恢复处理。
 
@@ -163,7 +165,7 @@ $DSH_HOME/workspace-memory
         checkpointTurns: 10
         checkpointChars: 4000
         idleCheckpointMs: 300000
-        processingDelayMs: 15000
+        processingDelayMs: 5000
         maxConcurrentDistillations: 1
         consolidateEvery: 5
         summaryMaxBytes: 3000
@@ -178,6 +180,8 @@ $DSH_HOME/workspace-memory
 
 `summarizeProvider` 和 `summarizeModel` 默认固定为 DSH 账户的 Flash 模型，也可以直接在设置页选择其他当前可用模型。
 
+记忆整理不会继承聊天 Session 的思考设置。插件会按所选模型的能力自动使用最低推理档：支持 `off` 时关闭思考，只提供非关闭档位时选择最低档，不支持推理控制时不发送该参数。
+
 `processingDelayMs` 是普通对话完成后的合并窗口；`maxConcurrentDistillations` 是跨工作区同时整理的最大请求数。通常保留默认值即可。整理模型建议直接在设置页选择，避免手工填写 provider/model 标识。
 
 ## 常见问题
@@ -188,7 +192,7 @@ $DSH_HOME/workspace-memory
 
 ### 刚结束对话，为什么还没有新记忆
 
-普通对话默认在完成后等待 15 秒合并窗口再进入后台队列。若长时间停留在待整理、排队或重试状态，可在记忆设置页查看最近错误，并确认固定模型和对应 provider 可用。
+普通对话默认在完成后等待 5 秒合并窗口再进入后台队列。若长时间停留在待整理、排队或重试状态，可在记忆设置页查看最近错误，并确认固定模型和对应 provider 可用。
 
 ### 为什么某些聊天内容没有保存
 

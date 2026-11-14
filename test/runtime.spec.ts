@@ -6,8 +6,15 @@ import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { onTestFinished, test } from 'vitest'
 import { Context, Service } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
-import LlmRuntime, { createUserMessage, LlmAdapter, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm'
+import { agentCarrier, type Agent } from '@deepseek-ai/dsh-agent'
+import LlmRuntime, {
+  createUserMessage,
+  LlmAdapter,
+  ReasoningEffortId,
+  type GenerateOptions,
+  type LlmResolvedModelInfo,
+  type StreamChunk,
+} from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
@@ -50,6 +57,24 @@ class CapturingMemoryAdapter extends LlmAdapter {
       text: '{"version":1,"operations":[{"op":"add","content":"新版会话事件能够触发记忆整理。","tags":["compatibility"],"importance":2}]}',
     }
     yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+}
+
+class ReasoningMemoryAdapter extends CapturingMemoryAdapter {
+  constructor(private readonly efforts?: readonly string[]) {
+    super()
+  }
+
+  override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    const info = await super.resolveModel(provider, model)
+    if (this.efforts === undefined) return info
+    return {
+      ...info,
+      reasoning: {
+        efforts: this.efforts.map(id => ({ id: ReasoningEffortId(id), name: id })),
+        defaultEffort: ReasoningEffortId(this.efforts.at(-1) ?? ''),
+      },
+    }
   }
 }
 
@@ -407,6 +432,162 @@ test('uses the configured fixed memory model', async () => {
   assert.equal(result.status, 'committed')
   assert.equal(adapter.requests[0]?.provider, 'memory-provider')
   assert.equal(adapter.requests[0]?.model, 'memory-model')
+})
+
+test('selects the least reasoning effort supported by the memory model', async () => {
+  const cases = [
+    { name: 'prefers off when available', efforts: ['off', 'low', 'high'], expected: 'off' },
+    { name: 'uses the advertised minimum without off', efforts: ['low', 'high'], expected: 'low' },
+    { name: 'omits reasoning for models without reasoning metadata', efforts: undefined, expected: undefined },
+  ] as const
+
+  for (const current of cases) {
+    const memoryDir = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-reasoning-'))
+    const ctx = new Context()
+    const adapter = new ReasoningMemoryAdapter(current.efforts)
+    try {
+      await ctx.plugin(SessionStore)
+      await ctx.plugin(LlmRuntime)
+      ctx.llm.registerAdapter(['memory-provider'], adapter)
+      await ctx.plugin(WorkspaceMemoryRuntime, {
+        memoryDir,
+        summarizeProvider: 'memory-provider',
+        summarizeModel: 'memory-model',
+      })
+      await flushAsyncWork()
+
+      const memory = ctx.get('workspaceMemory')
+      assert.ok(memory)
+      const result = await memory.checkpoint({
+        cwd: join(memoryDir, 'project'),
+        reason: 'explicit',
+        messages: [{ id: `reasoning-${current.name}`, role: 'user', text: '整理任务使用最低推理档。' }],
+      })
+      assert.equal(result.status, 'committed', current.name)
+      assert.equal(adapter.requests[0]?.reasoningEffort, current.expected, current.name)
+    } finally {
+      await ctx.fiber.dispose()
+      await rm(memoryDir, { recursive: true, force: true })
+    }
+  }
+})
+
+test('refreshes pending memory before a new session first recalls the workspace', async () => {
+  const memoryDir = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-freshness-'))
+  const workspace = join(memoryDir, 'project')
+  const ctx = new Context()
+  const adapter = new CapturingMemoryAdapter()
+  onTestFinished(async () => {
+    await ctx.fiber.dispose()
+    await rm(memoryDir, { recursive: true, force: true })
+  })
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(LlmRuntime)
+  ctx.llm.registerAdapter(['test'], adapter)
+  await ctx.plugin(WorkspaceMemoryRuntime, {
+    memoryDir,
+    processingDelayMs: 60_000,
+    summarizeProvider: 'test',
+    summarizeModel: 'test',
+  })
+  await flushAsyncWork()
+
+  const memory = ctx.get('workspaceMemory')
+  assert.ok(memory)
+  const buffered = await memory.checkpoint({
+    cwd: workspace,
+    reason: 'segment-end',
+    defer: true,
+    messages: [{ id: 'freshness-user', role: 'user', text: '请记住新版会话事件已经兼容。' }],
+  })
+  assert.equal(buffered.pending, 1)
+  assert.equal(adapter.requests.length, 0)
+
+  const session = ctx.sessions.create(SessionId('memory-freshness-new-session'), { meta: { cwd: workspace } })
+  const agent = { session } as Agent
+  const query = createUserMessage({
+    content: [{ type: 'text', text: '新版会话事件是否兼容？' }],
+    source: { kind: 'user' },
+  })
+  const decision = await ctx.waterfall(agentCarrier(agent), 'agent/pre-step', {
+    agent,
+    messages: [query],
+    turn: 1,
+    step: 1,
+    signal: new AbortController().signal,
+    modelSelection: { provider: 'foreground', model: 'foreground' },
+  }, async () => ({ kind: 'enter' as const, messages: [] }))
+
+  assert.equal(adapter.requests.length, 1)
+  const state = await new WorkspaceMemoryStore(memoryDir).readState(new WorkspaceMemoryStore(memoryDir).scope(workspace))
+  assert.equal(state.pendingMessages.length, 0)
+  assert.equal(decision.kind, 'enter')
+  const recalledText = decision.kind === 'enter'
+    ? decision.messages.at(-1)?.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n') ?? ''
+    : ''
+  assert.match(recalledText, /新版会话事件能够触发记忆整理/u)
+})
+
+test('continues first recall with existing memory when pending refresh exceeds ten seconds', async () => {
+  const memoryDir = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-freshness-timeout-'))
+  const workspace = join(memoryDir, 'project')
+  const ctx = new Context()
+  const adapter = new BlockingMemoryAdapter()
+  onTestFinished(async () => {
+    adapter.release()
+    await new Promise(resolve => setTimeout(resolve, 20))
+    await ctx.fiber.dispose()
+    await rm(memoryDir, { recursive: true, force: true })
+  })
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(LlmRuntime)
+  ctx.llm.registerAdapter(['test'], adapter)
+  await ctx.plugin(WorkspaceMemoryRuntime, {
+    memoryDir,
+    processingDelayMs: 60_000,
+    summarizeProvider: 'test',
+    summarizeModel: 'test',
+  })
+  await flushAsyncWork()
+
+  const memory = ctx.get('workspaceMemory')
+  assert.ok(memory)
+  const runtime = memory as unknown as { freshnessWaitMs: number }
+  runtime.freshnessWaitMs = 10
+  await memory.remember({ cwd: workspace, content: '已有记忆在整理超时时仍然可以召回。', tags: ['超时'] })
+  await memory.checkpoint({
+    cwd: workspace,
+    reason: 'segment-end',
+    defer: true,
+    messages: [{ id: 'freshness-timeout-user', role: 'user', text: '这条新内容的整理会被阻塞。' }],
+  })
+
+  const session = ctx.sessions.create(SessionId('memory-freshness-timeout-session'), { meta: { cwd: workspace } })
+  const agent = { session } as Agent
+  const query = createUserMessage({
+    content: [{ type: 'text', text: '整理超时时已有记忆还能召回吗？' }],
+    source: { kind: 'user' },
+  })
+  const decisionPromise = ctx.waterfall(agentCarrier(agent), 'agent/pre-step', {
+    agent,
+    messages: [query],
+    turn: 1,
+    step: 1,
+    signal: new AbortController().signal,
+    modelSelection: { provider: 'foreground', model: 'foreground' },
+  }, async () => ({ kind: 'enter' as const, messages: [] }))
+  for (let attempt = 0; attempt < 20 && adapter.requests.length === 0; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 1))
+  }
+  assert.equal(adapter.requests.length, 1)
+
+  const decision = await decisionPromise
+  const recalledText = decision.kind === 'enter'
+    ? decision.messages.at(-1)?.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n') ?? ''
+    : ''
+  assert.match(recalledText, /已有记忆在整理超时时仍然可以召回/u)
+  adapter.release()
+  await memory.checkpoint({ cwd: workspace, messages: [], reason: 'idle' })
 })
 
 test('limits concurrent memory distillations across workspaces', async () => {

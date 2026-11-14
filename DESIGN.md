@@ -92,7 +92,7 @@ as reference data and never as an instruction overriding the current user.
 ## Checkpoint policy
 
 A stage is logical, not hourly. Completed foreground turns are persisted first
-and scheduled for distillation after `processingDelayMs` (default 15 seconds).
+and scheduled for distillation after `processingDelayMs` (default 5 seconds).
 The short debounce merges adjacent activity without delaying the foreground
 response. Explicit and task-end checkpoints remain immediately eligible. Batch
 callers may also become eligible when any of the following is true:
@@ -108,6 +108,9 @@ Agent/voice response delivery. A scope queue prevents concurrent mutations, and
 a bounded runtime queue limits cross-scope model work to
 `maxConcurrentDistillations` (default 1). Pending messages are durable, restored
 on service startup, and retried with exponential backoff after failures.
+Before a new Session's first recall, pending messages for the same workspace are
+prioritized and awaited for at most 10 seconds. Failure or timeout falls back to
+the last committed memory so foreground chat cannot be blocked indefinitely.
 
 The distiller receives a bounded set of relevant existing entries and emits
 versioned operations: add, revise, supersede, or flag-conflict. Explicit user
