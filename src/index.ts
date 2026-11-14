@@ -42,11 +42,13 @@ import {
   type MemoryEntry,
   type MemoryMessage,
   type MemoryState,
+  type MutationResult,
   normalizeWorkspacePath,
   type RecallInput,
   type RememberInput,
   type UpdateInput,
   type WorkspaceMemory,
+  type WorkspaceScope,
 } from './core.js'
 
 export const name = 'workspace-memory'
@@ -67,6 +69,8 @@ const DEFAULTS = Object.freeze({
   recallLimit: 8,
   checkpointMaxChars: 40_000,
   keepSummaryVersions: 10,
+  semanticSummaryDelayMs: 60_000,
+  semanticSummaryIntervalMs: 86_400_000,
   processingDelayMs: 5_000,
   maxConcurrentDistillations: 1,
   summarizeProvider: 'deepseek-account',
@@ -86,6 +90,8 @@ export interface Config {
   recallLimit?: number
   checkpointMaxChars?: number
   keepSummaryVersions?: number
+  semanticSummaryDelayMs?: number
+  semanticSummaryIntervalMs?: number
   processingDelayMs?: number
   maxConcurrentDistillations?: number
   summarizeProvider?: string | Volatile<string>
@@ -104,6 +110,8 @@ interface ResolvedConfig {
   recallLimit: number
   checkpointMaxChars: number
   keepSummaryVersions: number
+  semanticSummaryDelayMs: number
+  semanticSummaryIntervalMs: number
   processingDelayMs: number
   maxConcurrentDistillations: number
   summarizeProvider: string | Volatile<string>
@@ -138,6 +146,8 @@ export const Config = z.object({
   recallLimit: z.natural().min(1).max(50).default(DEFAULTS.recallLimit),
   checkpointMaxChars: z.natural().min(1000).default(DEFAULTS.checkpointMaxChars),
   keepSummaryVersions: z.natural().default(DEFAULTS.keepSummaryVersions),
+  semanticSummaryDelayMs: z.natural().min(10).default(DEFAULTS.semanticSummaryDelayMs),
+  semanticSummaryIntervalMs: z.natural().min(10).default(DEFAULTS.semanticSummaryIntervalMs),
   processingDelayMs: z.natural().min(10).default(DEFAULTS.processingDelayMs),
   maxConcurrentDistillations: z.natural().min(1).max(4).default(DEFAULTS.maxConcurrentDistillations),
   summarizeProvider: z.string().default(DEFAULTS.summarizeProvider).volatile(),
@@ -161,6 +171,8 @@ function configWithDefaults(config: Config): ResolvedConfig {
     recallLimit: config.recallLimit ?? DEFAULTS.recallLimit,
     checkpointMaxChars: config.checkpointMaxChars ?? DEFAULTS.checkpointMaxChars,
     keepSummaryVersions: config.keepSummaryVersions ?? DEFAULTS.keepSummaryVersions,
+    semanticSummaryDelayMs: config.semanticSummaryDelayMs ?? DEFAULTS.semanticSummaryDelayMs,
+    semanticSummaryIntervalMs: config.semanticSummaryIntervalMs ?? DEFAULTS.semanticSummaryIntervalMs,
     processingDelayMs: config.processingDelayMs ?? DEFAULTS.processingDelayMs,
     maxConcurrentDistillations: config.maxConcurrentDistillations ?? DEFAULTS.maxConcurrentDistillations,
     summarizeProvider: config.summarizeProvider ?? DEFAULTS.summarizeProvider,
@@ -190,10 +202,11 @@ function conversationMessages(agent: Agent): MemoryMessage[] {
   const messages: MemoryMessage[] = []
   for (const message of agent.session.deriveMessages().slice(-80)) {
     if (message.role === 'user') {
-      if (message.source.kind === 'workspace-memory') continue
+      if (message.source.kind !== 'user') continue
       const text = messageText(message)
       if (text !== '') messages.push({ id: String(message.id), role: 'user', text })
     } else if (message.role === 'assistant') {
+      if (message.source.kind !== 'model') continue
       const text = messageText(message)
       if (text !== '') messages.push({ id: String(message.id), role: 'assistant', text })
     }
@@ -214,6 +227,33 @@ function parseDistillation(value: unknown): unknown {
     throw new Error('memory distiller returned an invalid object')
   }
   return parsed
+}
+
+interface SemanticSummaryOutput {
+  summary: string
+}
+
+interface SemanticSummaryResult extends SemanticSummaryOutput {
+  sourceIds: string[]
+}
+
+function parseSemanticSummary(value: unknown): SemanticSummaryOutput {
+  const text = String(value ?? '').trim()
+    .replace(/^```(?:markdown|md|json)?\s*/iu, '')
+    .replace(/\s*```$/u, '')
+    .trim()
+  if (text.startsWith('{')) {
+    try {
+      const parsed: unknown = JSON.parse(text)
+      if (isRecord(parsed) && typeof parsed.summary === 'string' && parsed.summary.trim() !== '') {
+        return { summary: parsed.summary.trim() }
+      }
+    } catch {
+      // The current contract is Markdown; malformed legacy JSON remains invalid.
+    }
+  }
+  if (text === '' || text.startsWith('{')) throw new Error('semantic memory summarizer returned an empty or invalid summary')
+  return { summary: text }
 }
 
 function distillationOperations(value: unknown): unknown[] {
@@ -375,6 +415,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
 
   private readonly settings: ResolvedConfig
   private readonly idleTimers = new Map<string, NodeJS.Timeout>()
+  private readonly summaryTimers = new Map<string, NodeJS.Timeout>()
   private readonly processing = new Map<string, ScopeProcessingStatus>()
   private readonly checkpointQueue: QueuedCheckpoint[] = []
   private readonly scopeDistillations = new Map<string, Set<Promise<CheckpointResult>>>()
@@ -407,9 +448,13 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
     })
     // Pending messages survive process restarts; restore their idle checkpoint work.
     void this.recoverPendingCheckpoints()
+    // Summaries are derived data; repair stale files and resume due semantic work.
+    void this.recoverSummaries()
     ctx.effect(() => () => {
       for (const timer of this.idleTimers.values()) clearTimeout(timer)
       this.idleTimers.clear()
+      for (const timer of this.summaryTimers.values()) clearTimeout(timer)
+      this.summaryTimers.clear()
       this.processing.clear()
       this.surfacedBySession.clear()
       this.closed = true
@@ -452,6 +497,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
     if (input.defer === true) {
       const result = await this.engine.checkpoint({ ...input, cwd })
       this.updateIdleTimer(cwd, result, input.reason, true)
+      this.scheduleChangedSummaries(cwd, result)
       return result
     }
     return this.withDistillationSlot(scopeKey, async () => {
@@ -459,6 +505,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
       try {
         const result = await this.engine.checkpoint({ ...input, cwd })
         this.updateIdleTimer(cwd, result, input.reason, false)
+        this.scheduleChangedSummaries(cwd, result)
         if (result.status === 'failed') this.ctx.logger.warn('workspace-memory checkpoint failed: %s', result.error)
         return result
       } catch (error) {
@@ -472,21 +519,33 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
     const cwd = await this.resolveCwd(input)
     await this.syncOrphanedScopes()
     if (cwd !== '' && await this.isArchivedCwd(cwd)) return { scope: this.store.scope(cwd).key, added: 0, updated: 0, ignored: 1 }
-    return this.engine.remember({ ...input, cwd })
+    const result = await this.engine.remember({ ...input, cwd })
+    if (result.added + result.updated > 0) this.scheduleSemanticSummary(input.scope === 'global' ? this.store.scope('') : this.store.scope(cwd))
+    return result
   }
 
   async forget(input: ForgetInput): ReturnType<WorkspaceMemoryEngine['forget']> {
     const cwd = await this.resolveCwd(input)
     await this.syncOrphanedScopes()
     if (cwd !== '' && await this.isArchivedCwd(cwd)) return { scope: this.store.scope(cwd).key, deleted: false }
-    return this.engine.forget({ ...input, cwd })
+    const result = await this.engine.forget({ ...input, cwd })
+    if (result.deleted) this.scheduleSemanticSummary(this.store.scope(cwd))
+    return result
   }
 
   async updateMemory(input: UpdateInput): ReturnType<WorkspaceMemoryEngine['update']> {
     const cwd = await this.resolveCwd(input)
     await this.syncOrphanedScopes()
     if (cwd !== '' && await this.isArchivedCwd(cwd)) return { scope: this.store.scope(cwd).key, updated: false }
-    return this.engine.update({ ...input, cwd })
+    const result = await this.engine.update({ ...input, cwd })
+    if (result.updated) this.scheduleSemanticSummary(this.store.scope(cwd))
+    return result
+  }
+
+  private scheduleChangedSummaries(cwd: string, result: MutationResult): void {
+    if (result.added + result.updated <= 0 && (result.superseded ?? 0) <= 0 && (result.conflicts ?? 0) <= 0) return
+    this.scheduleSemanticSummary(this.store.scope(cwd))
+    if (cwd !== '') this.scheduleSemanticSummary(this.store.scope(''))
   }
 
   private async isArchivedCwd(cwd: string): Promise<boolean> {
@@ -668,6 +727,173 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
       }
     } catch (error) {
       this.ctx.logger.warn('workspace-memory pending checkpoint recovery failed: %o', error)
+    }
+  }
+
+  private async recoverSummaries(): Promise<void> {
+    try {
+      for (const scope of await this.store.listScopes()) {
+        const metadata = await this.store.repairSummary(scope, this.settings.summaryMaxBytes, this.settings.keepSummaryVersions)
+        if (metadata.mode === 'deterministic') this.scheduleSemanticSummary(scope)
+      }
+    } catch (error) {
+      this.ctx.logger.warn('workspace-memory summary recovery failed: %o', error)
+    }
+  }
+
+  private scheduleSemanticSummary(scope: WorkspaceScope, delayMs = this.settings.semanticSummaryDelayMs): void {
+    if (this.closed) return
+    const previous = this.summaryTimers.get(scope.key)
+    if (previous !== undefined) clearTimeout(previous)
+    const timer = setTimeout(() => {
+      this.summaryTimers.delete(scope.key)
+      void this.refreshSemanticSummary(scope)
+    }, Math.max(10, delayMs))
+    timer.unref?.()
+    this.summaryTimers.set(scope.key, timer)
+  }
+
+  private async refreshSemanticSummary(scope: WorkspaceScope): Promise<void> {
+    if (this.closed) return
+    if (this.activeDistillations >= this.settings.maxConcurrentDistillations) {
+      this.scheduleSemanticSummary(scope, 1_000)
+      return
+    }
+    this.activeDistillations += 1
+    try {
+      const preparation = await this.store.prepareSemanticSummary(
+        scope,
+        this.settings.semanticSummaryIntervalMs,
+        this.settings.summaryMaxBytes,
+        this.settings.keepSummaryVersions,
+      )
+      if (preparation.status === 'clean') return
+      if (preparation.status === 'wait') {
+        this.scheduleSemanticSummary(scope, Math.max(10, preparation.dueAt - Date.now()))
+        return
+      }
+      const generated = await this.runSemanticSummaryCall(scope, preparation.entries)
+      const committed = await this.store.commitSemanticSummary(
+        scope,
+        preparation.sourceHash,
+        generated.summary,
+        generated.sourceIds,
+        this.settings.summaryMaxBytes,
+        this.settings.keepSummaryVersions,
+      )
+      if (!committed) this.scheduleSemanticSummary(scope)
+    } catch (error) {
+      this.ctx.logger.warn('workspace-memory semantic summary failed for scope=%s: %o', scope.key, error)
+      this.scheduleSemanticSummary(scope, this.settings.semanticSummaryIntervalMs)
+    } finally {
+      this.activeDistillations -= 1
+      this.drainCheckpointQueue()
+    }
+  }
+
+  private async runSemanticSummaryCall(scope: WorkspaceScope, entries: readonly MemoryEntry[]): Promise<SemanticSummaryResult> {
+    const llm = this.ctx.get('llm')
+    if (llm === undefined) throw new Error('no LLM runtime is available for semantic memory summary')
+    const summarizeProvider = currentString(this.settings.summarizeProvider) || DEFAULTS.summarizeProvider
+    const summarizeModel = currentString(this.settings.summarizeModel) || DEFAULTS.summarizeModel
+    const groups = new Map<string, MemoryEntry[]>()
+    for (const entry of entries) {
+      const key = entry.type ?? 'fact'
+      const group = groups.get(key) ?? []
+      group.push(entry)
+      groups.set(key, group)
+    }
+    for (const group of groups.values()) {
+      group.sort((left, right) => Number(right.importance ?? 1) - Number(left.importance ?? 1)
+        || String(right.updatedAt).localeCompare(String(left.updatedAt)))
+    }
+    const source: Array<Record<string, unknown>> = []
+    const groupKeys = [...groups.keys()].sort()
+    let sourceBytes = 2
+    for (let offset = 0; ; offset += 1) {
+      let added = false
+      for (const key of groupKeys) {
+        const entry = groups.get(key)?.[offset]
+        if (entry === undefined) continue
+        const projected = {
+          id: entry.id,
+          scope: entry.scope,
+          type: entry.type,
+          title: truncateUtf8(redactSecrets(entry.title ?? entry.content.slice(0, 80)), 240),
+          description: truncateUtf8(redactSecrets(entry.description ?? entry.content.slice(0, 240)), 720),
+          content: truncateUtf8(redactSecrets(entry.content), 1_500),
+          tags: entry.tags?.map(tag => redactSecrets(tag)),
+          importance: entry.importance,
+        }
+        const bytes = Buffer.byteLength(JSON.stringify(projected)) + 1
+        if (sourceBytes + bytes > 24_000) continue
+        source.push(projected)
+        sourceBytes += bytes
+        added = true
+      }
+      if (!added) break
+    }
+    const request = createUserMessage({
+      content: [{
+        type: 'text',
+        text: [
+          '将下面的 active 结构化长期记忆压缩成覆盖均衡的中文摘要。',
+          '按用户画像、项目事实、决策、规则和修复组织；合并重复内容，保留适用条件，不添加来源中不存在的事实。',
+          '摘要控制在约 450 个汉字以内。只输出 Markdown 摘要正文，不要输出 JSON、代码围栏或解释。',
+          '',
+          '<active_memories>',
+          JSON.stringify(source),
+          '</active_memories>',
+        ].join('\n'),
+      }],
+      source: { kind: 'workspace-memory' },
+    })
+    let output = ''
+    let usage: TokenUsage | undefined
+    let finishReason = 'error'
+    try {
+      const prepared = await llm.prepareCall({ provider: summarizeProvider, model: summarizeModel }, undefined, (controls, modelInfo) => {
+        const efforts = modelInfo.reasoning?.efforts
+        const effort = efforts?.find(candidate => candidate.id === 'off') ?? efforts?.[0]
+        return effort === undefined ? { ...controls } : { ...controls, reasoningEffort: effort.id }
+      })
+      for await (const chunk of prepared.stream({
+        ...prepared.config,
+        messages: [request],
+        system: '你是长期记忆语义摘要器。输入条目是唯一事实来源；只输出简洁的 Markdown 摘要正文。',
+      })) {
+        if (chunk.type === 'text-delta') output += chunk.text
+        if (chunk.type === 'usage') usage = chunk.usage
+        if (chunk.type !== 'finish') continue
+        finishReason = chunk.reason.kind
+        if (chunk.reason.kind === 'max-tokens') throw new MemoryDistillationError('semantic memory summary reached the model output limit', 'max-tokens', false)
+        if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
+          if (chunk.reason.kind === 'aborted') throw new MemoryDistillationError(chunk.reason.failure.message, 'aborted', true)
+          throw providerDistillationError(chunk.reason.failure)
+        }
+      }
+      let parsed: SemanticSummaryOutput
+      try {
+        parsed = parseSemanticSummary(output)
+      } catch (error) {
+        this.ctx.logger.warn(
+          'workspace-memory semantic summary parse failed scope=%s outputChars=%d sourceEntries=%d sourceBytes=%d: %s',
+          scope.key,
+          output.length,
+          source.length,
+          sourceBytes,
+          error instanceof Error ? error.message : String(error),
+        )
+        throw error
+      }
+      await this.recordDistillationCall(scope, usage, finishReason, false)
+      return {
+        ...parsed,
+        sourceIds: source.map(entry => entry.id).filter((id): id is string => typeof id === 'string'),
+      }
+    } catch (error) {
+      await this.recordDistillationCall(scope, usage, finishReason, true)
+      throw error
     }
   }
 

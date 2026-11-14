@@ -12,9 +12,19 @@ test('memory edit save button uses the Host primary-button color pair', () => {
   assert.doesNotMatch(clientSource, /color:\s*'#fff',\s*background:\s*colors\.accent/u)
 })
 
-test('memory settings expose distillation token usage and blocked retry controls', () => {
-  assert.match(clientSource, /tokenUsage:\s*'整理 Token'/u)
+test('memory settings show daily and cumulative tokens only for workspace scopes', () => {
+  assert.match(clientSource, /todayTokenUsage:\s*'今日整理'/u)
+  assert.match(clientSource, /totalTokenUsage:\s*'累计整理'/u)
+  assert.match(clientSource, /displayedPayload\?\.scope\.kind === 'workspace' && h\('div'/u)
+  assert.doesNotMatch(clientSource, /failedCalls:\s*'失败调用'/u)
+  assert.doesNotMatch(clientSource, /distillCalls:\s*'整理调用'/u)
   assert.match(clientSource, /state\.distillation\.totalTokens/u)
+  assert.match(clientSource, /state\.distillation\.todayTokens/u)
+  assert.match(clientSource, /formatTokenUsage\(totalTokens\)/u)
+  assert.match(clientSource, /title:\s*exactTokenUsage\(totalTokens\)/u)
+  assert.match(clientSource, /cacheHitTokens:\s*'缓存命中'/u)
+  assert.match(clientSource, /cacheHitRate:\s*'命中率'/u)
+  assert.match(clientSource, /tokenUsageRow\(/u)
   assert.match(clientSource, /state\.processing\.phase === 'blocked'/u)
   assert.match(clientSource, /workspace-memory\/api\/v1\/retry/u)
 })

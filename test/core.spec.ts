@@ -7,8 +7,10 @@ import {
   WorkspaceMemoryEngine,
   WorkspaceMemoryStore,
   checkpointEligible,
+  distillationCandidateBytes,
   lexicalTokens,
   normalizeWorkspacePath,
+  selectDistillationCandidates,
   scopeKeyForCwd,
   searchEntries,
   type DistillInput,
@@ -72,6 +74,66 @@ test('tokenizes ASCII words and Chinese bigrams without BM25', () => {
   assert.ok(tokens.includes('agent'))
   assert.ok(tokens.includes('长期'))
   assert.ok(tokens.includes('记忆'))
+})
+
+test('selects bounded distillation candidates from user text without recent-memory fallback', () => {
+  const entries = [
+    { id: 'location', content: '用户现居上海市。', title: '现居城市', tags: ['profile'], status: 'active' as const },
+    { id: 'tts', content: 'Qwen TTS 按字符计费。', title: 'TTS 定价', tags: ['tts'], status: 'active' as const, updatedAt: '2099-01-01T00:00:00Z' },
+  ]
+  const selected = selectDistillationCandidates(entries, [
+    { id: 'u1', role: 'user', text: '我现在住在上海市。' },
+    { id: 'a1', role: 'assistant', text: '这与 Qwen TTS 定价没有关系。' },
+  ])
+  assert.deepEqual(selected.map(entry => entry.id), ['location'])
+  assert.deepEqual(selectDistillationCandidates(entries, [{ id: 'u2', role: 'user', text: '今天天气不错。' }]), [])
+  assert.deepEqual(selectDistillationCandidates(entries, [{ id: 'a2', role: 'assistant', text: '用户现居上海市。' }]), [])
+})
+
+test('caps distillation candidates at six entries and three kilobytes by default', () => {
+  const entries = Array.from({ length: 10 }, (_, index) => ({
+    id: `database-${String(index)}`,
+    content: `项目数据库候选 ${String(index)}：${'数据库内容'.repeat(80)}`,
+    title: `数据库候选 ${String(index)}`,
+    tags: ['database'],
+    status: 'active' as const,
+  }))
+  const selected = selectDistillationCandidates(entries, [{ id: 'u1', role: 'user', text: '项目数据库如何选择？' }])
+  assert.ok(selected.length <= 6)
+  assert.ok(selected.reduce((total, entry) => total + distillationCandidateBytes(entry), 0) <= 3_000)
+})
+
+test('tracks workspace distillation tokens by local calendar day', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-daily-tokens-'))
+  let now = new Date(2026, 10, 14, 23, 55).getTime()
+  const store = new WorkspaceMemoryStore(root, { now: () => now })
+  const scope = store.scope(join(root, 'workspace'))
+  onTestFinished(() => rm(root, { recursive: true, force: true }))
+
+  await store.recordDistillationCall(scope, { failed: false, finishReason: 'stop', inputTokens: 20, outputTokens: 20, totalTokens: 120, cacheReadTokens: 80 })
+  const firstDay = await store.readState(scope)
+  assert.equal(firstDay.distillation.todayDate, '2026-11-14')
+  assert.equal(firstDay.distillation.todayTokens, 120)
+  assert.equal(firstDay.distillation.todayInputTokens, 20)
+  assert.equal(firstDay.distillation.todayCacheReadTokens, 80)
+  assert.equal(firstDay.distillation.todayCacheWriteTokens, 0)
+  assert.equal(firstDay.distillation.totalTokens, 120)
+
+  now = new Date(2026, 10, 15, 0, 5).getTime()
+  const afterMidnight = await store.readState(scope)
+  assert.equal(afterMidnight.distillation.todayDate, '2026-11-15')
+  assert.equal(afterMidnight.distillation.todayTokens, 0)
+  assert.equal(afterMidnight.distillation.todayInputTokens, 0)
+  assert.equal(afterMidnight.distillation.todayCacheReadTokens, 0)
+  assert.equal(afterMidnight.distillation.totalTokens, 120)
+
+  await store.recordDistillationCall(scope, { failed: false, finishReason: 'stop', inputTokens: 10, outputTokens: 5, totalTokens: 30, cacheReadTokens: 10, cacheWriteTokens: 5 })
+  const secondDay = await store.readState(scope)
+  assert.equal(secondDay.distillation.todayTokens, 30)
+  assert.equal(secondDay.distillation.todayInputTokens, 10)
+  assert.equal(secondDay.distillation.todayCacheReadTokens, 10)
+  assert.equal(secondDay.distillation.todayCacheWriteTokens, 5)
+  assert.equal(secondDay.distillation.totalTokens, 150)
 })
 
 test('ranks exact and CJK-related entries', () => {
@@ -298,6 +360,76 @@ test('keeps only the configured number of previous summaries', async () => {
   const scope = f.store.scope(cwd)
   const history = await readdir(join(scope.dir, 'summary_history'))
   assert.equal(history.length, 1)
+})
+
+test('uses a validated semantic summary until a memory mutation restores the deterministic fallback', async () => {
+  const f = await fixture()
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace-semantic-summary')
+  await f.engine.remember({ cwd, content: '用户现居上海市。', title: '现居城市', description: '用户长期居住在上海' })
+  const scope = f.store.scope(cwd)
+  const entry = (await f.store.readEntries(scope))[0]
+  assert.ok(entry)
+  assert.equal((await f.store.readSummaryMetadata(scope))?.mode, 'deterministic')
+
+  const prepared = await f.store.prepareSemanticSummary(scope, 0, 2000, 2)
+  assert.equal(prepared.status, 'ready')
+  if (prepared.status !== 'ready') throw new Error('semantic summary was not ready')
+  assert.equal(await f.store.commitSemanticSummary(
+    scope,
+    prepared.sourceHash,
+    '- 用户画像：现居火星。',
+    ['missing-entry'],
+    2000,
+    2,
+  ), false)
+  assert.doesNotMatch(await f.store.readSummary(scope), /火星/u)
+  assert.equal(await f.store.commitSemanticSummary(
+    scope,
+    prepared.sourceHash,
+    '- 用户画像：现居上海。',
+    [entry.id],
+    2000,
+    2,
+  ), true)
+  assert.equal((await f.store.readSummaryMetadata(scope))?.mode, 'semantic')
+  assert.match(await f.store.readSummary(scope), /用户画像：现居上海/u)
+
+  await f.engine.update({ cwd, id: entry.id, content: '用户现居北京市。', title: '现居城市', description: '用户长期居住在北京' })
+  assert.equal((await f.store.readSummaryMetadata(scope))?.mode, 'deterministic')
+  assert.doesNotMatch(await f.store.readSummary(scope), /用户画像：现居上海/u)
+  assert.match(await f.store.readSummary(scope), /用户长期居住在北京/u)
+  assert.equal((await f.store.prepareSemanticSummary(scope, 86_400_000, 2000, 2)).status, 'wait')
+  f.advance(86_400_000)
+  assert.equal((await f.store.prepareSemanticSummary(scope, 86_400_000, 2000, 2)).status, 'ready')
+})
+
+test('repairs a missing or stale summary from canonical entries without a model call', async () => {
+  const f = await fixture()
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace-summary-repair')
+  const scope = f.store.scope(cwd)
+  await f.store.ensure(scope)
+  await f.store.writeEntries(scope, [{ id: 'repair-entry', content: '启动扫描应恢复这条事实。', status: 'active' }])
+  const metadata = await f.store.repairSummary(scope, 2000, 2)
+  assert.equal(metadata.mode, 'deterministic')
+  assert.match(await f.store.readSummary(scope), /启动扫描应恢复这条事实/u)
+})
+
+test('does not rebuild a summary for successful checkpoints without memory mutations', async () => {
+  const f = await fixture({ config: { consolidateEvery: 1 }, distilled: { version: 1, operations: [] } })
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace-no-summary-churn')
+  await f.engine.remember({ cwd, content: '稳定事实不应被无变化 checkpoint 重写。' })
+  const scope = f.store.scope(cwd)
+  assert.equal((await readdir(join(scope.dir, 'summary_history'))).length, 0)
+  await f.engine.checkpoint({
+    cwd,
+    reason: 'task-end',
+    force: true,
+    messages: [{ id: 'u-no-change', role: 'user', text: '这轮没有新的长期事实。' }],
+  })
+  assert.equal((await readdir(join(scope.dir, 'summary_history'))).length, 0)
 })
 
 test('merges global and workspace memories while preserving field-aware ranking', async () => {
@@ -529,7 +661,10 @@ test('rejects supersede without verbatim user evidence and audits the rejection'
     cwd,
     reason: 'task-end',
     force: true,
-    messages: [{ id: 'a1', role: 'assistant', text: '项目数据库使用 PostgreSQL。' }],
+    messages: [
+      { id: 'u1', role: 'user', text: '请检查项目数据库配置。' },
+      { id: 'a1', role: 'assistant', text: '项目数据库使用 PostgreSQL。' },
+    ],
   })
   assert.equal(result.ignored, 1)
   const scope = f.store.scope(cwd)
@@ -560,7 +695,10 @@ test('keeps uncertain corrections as an explicit conflict and excludes the group
     cwd,
     reason: 'task-end',
     force: true,
-    messages: [{ id: 'a1', role: 'assistant', text: '代码看起来可能使用 PostgreSQL。' }],
+    messages: [
+      { id: 'u1', role: 'user', text: '请检查项目数据库配置。' },
+      { id: 'a1', role: 'assistant', text: '代码看起来可能使用 PostgreSQL。' },
+    ],
   })
   assert.equal(result.conflicts, 1)
   const scope = f.store.scope(cwd)
@@ -600,7 +738,10 @@ test('an explicit correction supersedes only the named member of a conflict grou
     cwd,
     reason: 'task-end',
     force: true,
-    messages: [{ id: 'a-conflict', role: 'assistant', text: '项目数据库可能使用 PostgreSQL。' }],
+    messages: [
+      { id: 'u-conflict', role: 'user', text: '请检查项目数据库配置。' },
+      { id: 'a-conflict', role: 'assistant', text: '项目数据库可能使用 PostgreSQL。' },
+    ],
   })
   const result = await f.engine.checkpoint({
     cwd,

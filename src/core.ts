@@ -189,12 +189,32 @@ export interface MemoryState {
   distillation: DistillationStats
 }
 
+export interface SummaryMetadata {
+  version: 1
+  mode: 'deterministic' | 'semantic'
+  sourceHash: string
+  updatedAt: number
+  semanticLastAttemptAt?: number
+  semanticLastSuccessAt?: number
+  sourceIds?: string[]
+}
+
+export type SemanticSummaryPreparation =
+  | { status: 'clean' }
+  | { status: 'wait'; dueAt: number }
+  | { status: 'ready'; scope: WorkspaceScope; sourceHash: string; entries: MemoryEntry[] }
+
 export interface DistillationStats {
   calls: number
   failures: number
   inputTokens: number
   outputTokens: number
   totalTokens: number
+  todayDate: string
+  todayTokens: number
+  todayInputTokens: number
+  todayCacheReadTokens: number
+  todayCacheWriteTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
   reasoningTokens: number
@@ -264,6 +284,7 @@ interface AppliedOperations extends MutationResult {
 }
 
 export const SUMMARY_FILE = 'memory_summary.md'
+export const SUMMARY_META_FILE = 'summary_meta.json'
 export const ENTRIES_FILE = 'memory_entries.json'
 export const STATE_FILE = 'state.json'
 export const CHECKPOINT_DIR = 'checkpoints'
@@ -283,6 +304,11 @@ const DEFAULT_STATE: Readonly<MemoryState> = Object.freeze({
     inputTokens: 0,
     outputTokens: 0,
     totalTokens: 0,
+    todayDate: '',
+    todayTokens: 0,
+    todayInputTokens: 0,
+    todayCacheReadTokens: 0,
+    todayCacheWriteTokens: 0,
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
     reasoningTokens: 0,
@@ -293,9 +319,23 @@ const DEFAULT_STATE: Readonly<MemoryState> = Object.freeze({
 
 const MAX_CONSECUTIVE_DISTILLATION_FAILURES = 5
 
-function distillationStats(value: unknown): DistillationStats {
+function localDateKey(timestamp: number): string {
+  const date = new Date(timestamp)
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${String(date.getFullYear())}-${month}-${day}`
+}
+
+function distillationStats(value: unknown, todayDate: string): DistillationStats {
   const stats = isRecord(value) ? value : {}
   const number = (key: keyof DistillationStats): number => typeof stats[key] === 'number' ? stats[key] : 0
+  const sameDay = stats.todayDate === todayDate
+  const canInferTodayBreakdown = sameDay && number('todayTokens') === number('totalTokens')
+  const todayNumber = (key: 'todayInputTokens' | 'todayCacheReadTokens' | 'todayCacheWriteTokens', cumulativeKey: 'inputTokens' | 'cacheReadTokens' | 'cacheWriteTokens'): number => {
+    if (!sameDay) return 0
+    if (typeof stats[key] === 'number') return stats[key]
+    return canInferTodayBreakdown ? number(cumulativeKey) : 0
+  }
   const errorCode = typeof stats.lastErrorCode === 'string'
     && ['max-tokens', 'invalid-output', 'provider-error', 'aborted'].includes(stats.lastErrorCode)
     ? stats.lastErrorCode as DistillationErrorCode
@@ -306,6 +346,11 @@ function distillationStats(value: unknown): DistillationStats {
     inputTokens: number('inputTokens'),
     outputTokens: number('outputTokens'),
     totalTokens: number('totalTokens'),
+    todayDate,
+    todayTokens: sameDay ? number('todayTokens') : 0,
+    todayInputTokens: todayNumber('todayInputTokens', 'inputTokens'),
+    todayCacheReadTokens: todayNumber('todayCacheReadTokens', 'cacheReadTokens'),
+    todayCacheWriteTokens: todayNumber('todayCacheWriteTokens', 'cacheWriteTokens'),
     cacheReadTokens: number('cacheReadTokens'),
     cacheWriteTokens: number('cacheWriteTokens'),
     reasoningTokens: number('reasoningTokens'),
@@ -549,6 +594,41 @@ function deterministicSummary(entries: readonly MemoryEntry[], maxBytes: number,
   return lines.join('\n').trimEnd() + '\n'
 }
 
+function summarySourceEntries(entries: readonly MemoryEntry[]): MemoryEntry[] {
+  return entries.filter(isSummarizable).sort((left, right) => left.id.localeCompare(right.id))
+}
+
+export function summarySourceHash(entries: readonly MemoryEntry[]): string {
+  const source = summarySourceEntries(entries).map(entry => ({
+    id: entry.id,
+    scope: entry.scope,
+    type: entry.type,
+    title: entry.title,
+    description: entry.description,
+    content: entry.content,
+    tags: entry.tags,
+    importance: entry.importance,
+    status: entry.status,
+    updatedAt: entry.updatedAt,
+  }))
+  return createHash('sha256').update(JSON.stringify(source)).digest('hex')
+}
+
+function semanticSummaryDocument(scope: WorkspaceScope, summary: string, maxBytes: number): string {
+  const lines = [
+    scope.key === 'global' ? '# 全局记忆' : '# 项目记忆',
+    '',
+    '由 dsh-workspace-memory 根据结构化记忆生成的语义摘要。',
+    '',
+  ]
+  for (const line of summary.trim().split(/\r?\n/u).map(value => value.trim()).filter(Boolean)) {
+    if (Buffer.byteLength([...lines, line, ''].join('\n')) > maxBytes) break
+    lines.push(line)
+  }
+  if (lines.length === 4) throw new Error('semantic memory summary is empty or exceeds the byte budget')
+  return lines.join('\n').trimEnd() + '\n'
+}
+
 function checkpointMarkdown(
   reason: CheckpointReason,
   messages: readonly MemoryMessage[],
@@ -666,10 +746,10 @@ export class WorkspaceMemoryStore {
         lastBufferedAt: typeof value.lastBufferedAt === 'number' ? value.lastBufferedAt : DEFAULT_STATE.lastBufferedAt,
         pendingMessages: safeArray(value.pendingMessages).filter(validMessage),
         seenMessageIds: safeArray(value.seenMessageIds).filter((item): item is string => typeof item === 'string'),
-        distillation: distillationStats(value.distillation),
+        distillation: distillationStats(value.distillation, localDateKey(this.now())),
       }
     } catch {
-      return { ...DEFAULT_STATE, pendingMessages: [], seenMessageIds: [], distillation: distillationStats(undefined) }
+      return { ...DEFAULT_STATE, pendingMessages: [], seenMessageIds: [], distillation: distillationStats(undefined, localDateKey(this.now())) }
     }
   }
 
@@ -680,17 +760,26 @@ export class WorkspaceMemoryStore {
       const current = state.distillation
       const derivedTotal = (call.inputTokens ?? 0) + (call.outputTokens ?? 0)
         + (call.cacheReadTokens ?? 0) + (call.cacheWriteTokens ?? 0)
+      const callTotal = call.totalTokens ?? derivedTotal
+      const callAt = this.now()
+      const todayDate = localDateKey(callAt)
+      const sameDay = current.todayDate === todayDate
       state.distillation = {
         ...current,
         calls: current.calls + 1,
         failures: current.failures + (call.failed ? 1 : 0),
         inputTokens: current.inputTokens + (call.inputTokens ?? 0),
         outputTokens: current.outputTokens + (call.outputTokens ?? 0),
-        totalTokens: current.totalTokens + (call.totalTokens ?? derivedTotal),
+        totalTokens: current.totalTokens + callTotal,
+        todayDate,
+        todayTokens: (sameDay ? current.todayTokens : 0) + callTotal,
+        todayInputTokens: (sameDay ? current.todayInputTokens : 0) + (call.inputTokens ?? 0),
+        todayCacheReadTokens: (sameDay ? current.todayCacheReadTokens : 0) + (call.cacheReadTokens ?? 0),
+        todayCacheWriteTokens: (sameDay ? current.todayCacheWriteTokens : 0) + (call.cacheWriteTokens ?? 0),
         cacheReadTokens: current.cacheReadTokens + (call.cacheReadTokens ?? 0),
         cacheWriteTokens: current.cacheWriteTokens + (call.cacheWriteTokens ?? 0),
         reasoningTokens: current.reasoningTokens + (call.reasoningTokens ?? 0),
-        lastCallAt: this.now(),
+        lastCallAt: callAt,
         lastFinishReason: call.finishReason,
       }
       await this.writeState(scope, state)
@@ -716,6 +805,27 @@ export class WorkspaceMemoryStore {
       .replace(/^# Global memory$/mu, '# 全局记忆')
       .replace(/^# Workspace memory$/mu, '# 项目记忆')
       .replace(/^Durable reference facts maintained by dsh-workspace-memory\.$/mu, '由 dsh-workspace-memory 维护的长期事实。')
+  }
+
+  async readSummaryMetadata(scope: WorkspaceScope): Promise<SummaryMetadata | undefined> {
+    const raw = await readFile(join(scope.dir, SUMMARY_META_FILE), 'utf8').catch(() => '')
+    try {
+      const value: unknown = JSON.parse(raw)
+      if (!isRecord(value) || value.version !== 1
+        || (value.mode !== 'deterministic' && value.mode !== 'semantic')
+        || typeof value.sourceHash !== 'string' || typeof value.updatedAt !== 'number') return undefined
+      return {
+        version: 1,
+        mode: value.mode,
+        sourceHash: value.sourceHash,
+        updatedAt: value.updatedAt,
+        ...(typeof value.semanticLastAttemptAt === 'number' ? { semanticLastAttemptAt: value.semanticLastAttemptAt } : {}),
+        ...(typeof value.semanticLastSuccessAt === 'number' ? { semanticLastSuccessAt: value.semanticLastSuccessAt } : {}),
+        ...(Array.isArray(value.sourceIds) ? { sourceIds: value.sourceIds.filter((id): id is string => typeof id === 'string') } : {}),
+      }
+    } catch {
+      return undefined
+    }
   }
 
   /** List persisted scopes without creating directories for unused projects. */
@@ -824,17 +934,114 @@ export class WorkspaceMemoryStore {
 
   async rebuildSummary(scope: WorkspaceScope, entries: readonly MemoryEntry[], maxBytes: number, keepHistory = 10): Promise<void> {
     this.invalidateSnapshot(scope)
+    const previousMetadata = await this.readSummaryMetadata(scope)
+    await this.writeSummaryContent(
+      scope,
+      deterministicSummary(entries, maxBytes, scope.key === 'global' ? '# 全局记忆' : '# 项目记忆'),
+      keepHistory,
+    )
+    await this.writeSummaryMetadata(scope, {
+      version: 1,
+      mode: 'deterministic',
+      sourceHash: summarySourceHash(entries),
+      updatedAt: this.now(),
+      ...(previousMetadata?.semanticLastAttemptAt === undefined ? {} : { semanticLastAttemptAt: previousMetadata.semanticLastAttemptAt }),
+      ...(previousMetadata?.semanticLastSuccessAt === undefined ? {} : { semanticLastSuccessAt: previousMetadata.semanticLastSuccessAt }),
+    })
+  }
+
+  async repairSummary(scope: WorkspaceScope, maxBytes: number, keepHistory = 10): Promise<SummaryMetadata> {
+    return this.withScope(scope, async () => {
+      await this.ensure(scope)
+      const entries = await this.readEntries(scope)
+      const sourceHash = summarySourceHash(entries)
+      const [summary, metadata] = await Promise.all([this.readSummary(scope), this.readSummaryMetadata(scope)])
+      if (summary.trim() === '' || metadata?.sourceHash !== sourceHash) {
+        await this.rebuildSummary(scope, entries, maxBytes, keepHistory)
+      }
+      return (await this.readSummaryMetadata(scope)) ?? {
+        version: 1,
+        mode: 'deterministic',
+        sourceHash,
+        updatedAt: this.now(),
+      }
+    })
+  }
+
+  async prepareSemanticSummary(scope: WorkspaceScope, minimumIntervalMs: number, maxBytes: number, keepHistory = 10): Promise<SemanticSummaryPreparation> {
+    return this.withScope(scope, async () => {
+      await this.ensure(scope)
+      const entries = await this.readEntries(scope)
+      const sourceHash = summarySourceHash(entries)
+      let metadata = await this.readSummaryMetadata(scope)
+      const summary = await this.readSummary(scope)
+      if (summary.trim() === '' || metadata?.sourceHash !== sourceHash) {
+        await this.rebuildSummary(scope, entries, maxBytes, keepHistory)
+        metadata = await this.readSummaryMetadata(scope)
+      }
+      if (summarySourceEntries(entries).length === 0 || metadata?.mode === 'semantic') return { status: 'clean' }
+      const lastAttemptAt = metadata?.semanticLastAttemptAt ?? 0
+      const dueAt = lastAttemptAt + Math.max(0, minimumIntervalMs)
+      if (dueAt > this.now()) return { status: 'wait', dueAt }
+      await this.writeSummaryMetadata(scope, {
+        version: 1,
+        mode: 'deterministic',
+        sourceHash,
+        updatedAt: metadata?.updatedAt ?? this.now(),
+        semanticLastAttemptAt: this.now(),
+        ...(metadata?.semanticLastSuccessAt === undefined ? {} : { semanticLastSuccessAt: metadata.semanticLastSuccessAt }),
+      })
+      return { status: 'ready', scope, sourceHash, entries: summarySourceEntries(entries) }
+    })
+  }
+
+  async commitSemanticSummary(
+    scope: WorkspaceScope,
+    sourceHash: string,
+    summary: string,
+    sourceIds: readonly string[],
+    maxBytes: number,
+    keepHistory = 10,
+  ): Promise<boolean> {
+    return this.withScope(scope, async () => {
+      const entries = await this.readEntries(scope)
+      if (summarySourceHash(entries) !== sourceHash) return false
+      const activeIds = new Set(summarySourceEntries(entries).map(entry => entry.id))
+      const uniqueSourceIds = [...new Set(sourceIds)]
+      if (uniqueSourceIds.length === 0 || uniqueSourceIds.some(id => !activeIds.has(id))) return false
+      const metadata = await this.readSummaryMetadata(scope)
+      const document = semanticSummaryDocument(scope, summary, maxBytes)
+      this.invalidateSnapshot(scope)
+      await this.writeSummaryContent(scope, document, keepHistory)
+      await this.writeSummaryMetadata(scope, {
+        version: 1,
+        mode: 'semantic',
+        sourceHash,
+        updatedAt: this.now(),
+        semanticLastAttemptAt: metadata?.semanticLastAttemptAt ?? this.now(),
+        semanticLastSuccessAt: this.now(),
+        sourceIds: uniqueSourceIds,
+      })
+      return true
+    })
+  }
+
+  private async writeSummaryContent(scope: WorkspaceScope, content: string, keepHistory: number): Promise<void> {
     const file = join(scope.dir, SUMMARY_FILE)
     const previous = await readFile(file, 'utf8').catch(() => '')
-    if (previous.trim() !== '') {
+    if (previous.trim() !== '' && previous !== content) {
       const history = join(scope.dir, HISTORY_DIR, `${String(this.now())}-${this.uuid()}.md`)
       await this.writeAtomic(history, previous)
     }
-    await this.writeAtomic(file, deterministicSummary(entries, maxBytes, scope.key === 'global' ? '# 全局记忆' : '# 项目记忆'))
+    await this.writeAtomic(file, content)
     const historyFiles = (await readdir(join(scope.dir, HISTORY_DIR)).catch(() => [])).sort().reverse()
     for (const stale of historyFiles.slice(Math.max(0, keepHistory))) {
       await unlink(join(scope.dir, HISTORY_DIR, stale)).catch(() => {})
     }
+  }
+
+  private async writeSummaryMetadata(scope: WorkspaceScope, metadata: SummaryMetadata): Promise<void> {
+    await this.writeAtomic(join(scope.dir, SUMMARY_META_FILE), JSON.stringify(metadata, null, 2) + '\n')
   }
 
   async writeCheckpoint(
@@ -1026,34 +1233,38 @@ function appendRevision(entry: MemoryEntry, nowIso: string): void {
 export function selectDistillationCandidates(
   entries: readonly MemoryEntry[],
   messages: readonly MemoryMessage[],
-  maxEntries = 20,
-  maxBytes = 12_000,
+  maxEntries = 6,
+  maxBytes = 3_000,
 ): MemoryEntry[] {
-  const query = messages.map(message => message.text).join('\n')
+  const query = messages.filter(message => message.role === 'user').map(message => message.text).join('\n')
+  if (query.trim() === '') return []
   const queryTokens = new Set(lexicalTokens(query))
-  const lexical = searchEntries(entries, query, { limit: Math.min(12, maxEntries) }).map(result => result.entry)
+  const lexical = searchEntries(entries, query, { limit: maxEntries }).map(result => result.entry)
   const sameTopic = entries.filter(entry => isRecallable(entry) && [entry.type, ...(entry.tags ?? [])]
     .flatMap(value => lexicalTokens(value))
     .some(token => queryTokens.has(token)))
-  const recent = entries.filter(isRecallable).sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt))).slice(0, 8)
   const selected: MemoryEntry[] = []
   let bytes = 0
-  for (const entry of [...lexical, ...sameTopic, ...recent]) {
+  for (const entry of [...lexical, ...sameTopic]) {
     if (selected.some(candidate => candidate.id === entry.id)) continue
-    const size = Buffer.byteLength(JSON.stringify({
-      id: entry.id,
-      scope: entry.scope,
-      status: entry.status,
-      type: entry.type,
-      content: entry.content,
-      tags: entry.tags,
-      conflictGroupId: entry.conflictGroupId,
-    }))
+    const size = distillationCandidateBytes(entry)
     if (selected.length >= maxEntries || bytes + size > maxBytes) continue
     selected.push(entry)
     bytes += size
   }
   return selected
+}
+
+export function distillationCandidateBytes(entry: MemoryEntry): number {
+  return Buffer.byteLength(JSON.stringify({
+    id: entry.id,
+    scope: entry.scope,
+    status: entry.status,
+    type: entry.type,
+    content: entry.content,
+    tags: entry.tags,
+    conflictGroupId: entry.conflictGroupId,
+  }))
 }
 
 function applyOperations(
@@ -1371,6 +1582,11 @@ export class WorkspaceMemoryEngine {
         scope.key === 'global' ? Promise.resolve([]) : this.store.readEntries(globalScope),
       ])
       const existingEntries = selectDistillationCandidates([...globalEntries, ...workspaceEntries], prepared.staged)
+      debugMemory('distill-candidates', {
+        scope: scope.key,
+        count: existingEntries.length,
+        bytes: existingEntries.reduce((total, entry) => total + distillationCandidateBytes(entry), 0),
+      })
       const distilled = await this.distill({ scope, messages: prepared.staged, reason: input.reason, existingEntries })
       operations = normalizeOperations(distilled)
       debugMemory('distill-complete', { scope: scope.key, durationMs: Math.max(0, this.store.now() - distillStartedAt), messages: prepared.staged.length })
@@ -1447,7 +1663,7 @@ export class WorkspaceMemoryEngine {
             return globalMutation
           })
         }
-        if (result.added + result.updated > 0 || state.checkpointCount % this.config.consolidateEvery === 0 || !(await this.store.readSummary(scope)).trim()) {
+        if (result.added + result.updated > 0 || !(await this.store.readSummary(scope)).trim()) {
           state.version += 1
           await this.store.rebuildSummary(scope, entries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
         }

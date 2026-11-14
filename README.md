@@ -116,7 +116,7 @@ dsh plugin --profile web remove --config.minimumReleaseAge=0 @flowingspring/dsh-
 
 同一工作区的新 Session 第一次召回记忆时，如果仍有待整理内容，插件会优先触发整理并最多等待 10 秒。整理超时或失败不会无限阻塞聊天，而是继续使用已有记忆。
 
-因此，刚结束对话后的短暂窗口内只看到“待整理”是正常现象；设置页会同时显示计划、排队、整理、重试或暂停状态，并累计展示后台整理调用数和实际输入/输出 token。暂停后可以在排除模型或配置问题后手工“立即重试”。DSH 服务停止时不会在独立进程中继续调用模型，重新启动后会恢复未被暂停的处理。
+因此，刚结束对话后的短暂窗口内只看到“待整理”是正常现象；设置页会同时显示计划、排队、整理、重试或暂停状态。工作区记忆显示本地自然日的今日整理 token 和累计整理 token，数值会按量级自适应显示为整数、K 或 M，悬停可查看精确值；全局记忆可能由多个工作区的整理请求共同产出，无法准确拆分消耗，因此不显示 token。暂停后可以在排除模型或配置问题后手工“立即重试”。DSH 服务停止时不会在独立进程中继续调用模型，重新启动后会恢复未被暂停的处理。
 
 ## 记忆整理模型
 
@@ -167,8 +167,9 @@ $DSH_HOME/workspace-memory
         idleCheckpointMs: 300000
         processingDelayMs: 5000
         maxConcurrentDistillations: 1
-        consolidateEvery: 5
         summaryMaxBytes: 3000
+        semanticSummaryDelayMs: 60000
+        semanticSummaryIntervalMs: 86400000
         recallMaxBytes: 5000
         recallLimit: 8
         checkpointMaxChars: 40000
@@ -179,6 +180,8 @@ $DSH_HOME/workspace-memory
 ```
 
 `summarizeProvider` 和 `summarizeModel` 默认固定为 DSH 账户的 Flash 模型，也可以直接在设置页选择其他当前可用模型。
+
+结构化记忆变更后会立即生成不调用模型的可靠摘要；后台语义摘要默认等待 60 秒，并且同一范围最多每 24 小时调用一次所选记忆模型。`semanticSummaryDelayMs` 控制安静窗口，`semanticSummaryIntervalMs` 控制最短调用间隔。DSH 启动只修复缺失或陈旧摘要，并续接已经到期的语义摘要任务。
 
 记忆整理不会继承聊天 Session 的思考设置。插件会按所选模型的能力自动使用最低推理档：支持 `off` 时关闭思考，只提供非关闭档位时选择最低档，不支持推理控制时不发送该参数。
 

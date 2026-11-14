@@ -28,6 +28,7 @@
 workspace-memory/
 ├── global/
 │   ├── memory_summary.md
+│   ├── summary_meta.json
 │   ├── memory_entries.json
 │   ├── state.json
 │   ├── checkpoints/
@@ -36,6 +37,7 @@ workspace-memory/
 │   └── ws-<sha256-prefix>/
 │       ├── scope.json
 │       ├── memory_summary.md
+│       ├── summary_meta.json
 │       ├── memory_entries.json
 │       ├── state.json
 │       ├── checkpoints/
@@ -44,14 +46,16 @@ workspace-memory/
     └── ws-<sha256-prefix>/
         ├── scope.json
         ├── memory_summary.md
+        ├── summary_meta.json
         ├── memory_entries.json
         ├── state.json
         ├── checkpoints/
         └── summary_history/
 ```
 
-`memory_entries.json` 是结构化事实的来源；`memory_summary.md` 是受大小限制的注入
-摘要；`state.json` 保存 checkpoint 缓冲和计数；`checkpoints/` 与 `summary_history/`
+`memory_entries.json` 是结构化事实的来源；`memory_summary.md` 是受大小限制的当前注入
+摘要；`summary_meta.json` 保存来源指纹、确定性/语义模式及语义摘要冷却时间；`state.json`
+保存 checkpoint 缓冲和计数；`checkpoints/` 与 `summary_history/`
 用于故障排查和变更审计。所有写入经过 scope 级串行队列，并使用临时文件原子替换。
 
 ## 4. 公共接口
@@ -92,9 +96,12 @@ interface WorkspaceMemory {
 - 默认空闲 5 分钟；
 - Session 关闭，或调用方显式强制 checkpoint。
 
-每轮只追加到缓冲区，不强制调用模型。任何记忆变更都会立即重建受影响 scope 的摘要，避免已纠正
-事实继续注入；每成功整理 5 次仍执行一次兜底重建，并保留有限版本历史。
-蒸馏器同时接收有数量和字节上限的相关现有记忆，并输出版本化操作：新增、修订、明确取代或
+每轮只追加到缓冲区，不强制调用模型。任何记忆变更都会立即重建不调用模型的确定性摘要，避免已纠正
+事实继续注入。后台语义摘要仅处理 dirty scope，等待默认 60 秒安静窗口，并限制为每个 scope
+最多 24 小时一次；输入按类型轮询且限制为 24 KB，模型只返回 Markdown 摘要正文，程序记录本次
+实际输入的来源 ID，并在提交前再次校验 active 条目指纹。启动时校验来源指纹并恢复到期任务。
+蒸馏器只用用户原话检索现有记忆，不使用助手回复扩大查询，也不补入最近条目；候选最多 6 条/3 KB。
+蒸馏器输出版本化操作：新增、修订、明确取代或
 标记冲突。明确取代必须引用本次用户消息原文及目标记忆原文；证据不足时保留双方并建立冲突组。
 修订前保存旧版本，取代后的条目继续保留用于审计。只有 active 条目进入稳定摘要，conflict
 只在相关查询命中时返回，superseded 不参与普通召回。旧版裸 proposal 输出兼容为新增操作。

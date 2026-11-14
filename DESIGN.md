@@ -38,6 +38,7 @@ Default root: `$DSH_HOME/workspace-memory` (fallback `~/.dsh/workspace-memory`).
 workspace-memory/
   global/
     memory_summary.md
+    summary_meta.json
     memory_entries.json
     state.json
     checkpoints/
@@ -46,6 +47,7 @@ workspace-memory/
     ws-<sha256-prefix>/
       scope.json
       memory_summary.md
+      summary_meta.json
       memory_entries.json
       state.json
       checkpoints/
@@ -54,6 +56,7 @@ workspace-memory/
     ws-<sha256-prefix>/
       scope.json
       memory_summary.md
+      summary_meta.json
       memory_entries.json
       state.json
       checkpoints/
@@ -112,7 +115,8 @@ Before a new Session's first recall, pending messages for the same workspace are
 prioritized and awaited for at most 10 seconds. Failure or timeout falls back to
 the last committed memory so foreground chat cannot be blocked indefinitely.
 
-The distiller receives a bounded set of relevant existing entries and emits
+The distiller retrieves existing entries from user-authored text only, sends no
+unrelated recency fallback, and caps candidates at six entries / 3 KB. It emits
 versioned operations: add, revise, supersede, or flag-conflict. Explicit user
 corrections may supersede an older fact only when verbatim user and target
 quotes validate against the checkpoint and current target. Uncertain conflicts
@@ -120,9 +124,15 @@ remain visible as a conflict group instead of silently disabling either fact.
 Revisions and superseded entries remain auditable, while only active facts enter
 the stable summary. Legacy proposal arrays remain compatible as add operations.
 
-Any memory mutation immediately rebuilds the affected scope summary so corrected
-facts cannot remain injected. `consolidateEvery` successful checkpoints (default
-5) provides a periodic fallback rebuild. A bounded history is kept before replacement.
+Any memory mutation immediately rebuilds a deterministic affected-scope summary
+so corrected facts cannot remain injected. `summary_meta.json` fingerprints the
+active entries and distinguishes this reliable fallback from a model-generated
+semantic summary. Semantic summarization runs only for dirty scopes, waits for a
+quiet window, and is rate-limited to once per 24 hours per scope. Its source is
+type-balanced and capped at 24 KB. The model returns only bounded Markdown;
+the runtime records the actual bounded input IDs and verifies that they still
+refer to active entries with the same fingerprint before commit. Startup repairs
+stale derived files and resumes due work. A bounded history is kept before replacement.
 
 ## DSH integration
 

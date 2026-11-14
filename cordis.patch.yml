@@ -11,4 +11,5 @@
         maxConcurrentDistillations: 1
         summarizeProvider: deepseek-account
         summarizeModel: deepseek-flash
-        consolidateEvery: 5
+        semanticSummaryDelayMs: 60000
+        semanticSummaryIntervalMs: 86400000

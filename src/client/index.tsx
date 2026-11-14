@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { createElement as h } from 'react'
 import type { SettingsSectionOwnerProps } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
+import { exactTokenUsage, formatCacheHitRate, formatTokenUsage } from './format.js'
 
 const NS = 'workspace-memory'
 
@@ -28,7 +29,6 @@ const zh = {
   purge: '永久删除',
   purgeConfirm: '确定永久删除这个项目的全部记忆吗？此操作无法撤销。',
   pending: '待整理',
-  checkpoints: '整理次数',
   updated: '最近更新',
   all: '全部',
   count: '条',
@@ -51,11 +51,10 @@ const zh = {
   nextRun: '下次运行',
   lastSuccess: '上次成功',
   lastError: '最近错误',
-  distillCalls: '整理调用',
-  failedCalls: '失败调用',
-  tokenUsage: '整理 Token',
-  inputTokens: '输入',
-  outputTokens: '输出',
+  todayTokenUsage: '今日整理',
+  totalTokenUsage: '累计整理',
+  cacheHitTokens: '缓存命中',
+  cacheHitRate: '命中率',
   retryNow: '立即重试',
   edit: '编辑',
   delete: '删除',
@@ -100,7 +99,6 @@ const en = {
   purge: 'Delete permanently',
   purgeConfirm: 'Permanently delete all memory for this project? This cannot be undone.',
   pending: 'Pending',
-  checkpoints: 'Checkpoints',
   updated: 'Last updated',
   all: 'All',
   count: '',
@@ -123,11 +121,10 @@ const en = {
   nextRun: 'Next run',
   lastSuccess: 'Last success',
   lastError: 'Last error',
-  distillCalls: 'Distillation calls',
-  failedCalls: 'Failed calls',
-  tokenUsage: 'Distillation tokens',
-  inputTokens: 'Input',
-  outputTokens: 'Output',
+  todayTokenUsage: 'Today',
+  totalTokenUsage: 'Total',
+  cacheHitTokens: 'Cache hit',
+  cacheHitRate: 'Hit rate',
   retryNow: 'Retry now',
   edit: 'Edit',
   delete: 'Delete',
@@ -179,6 +176,11 @@ interface DistillationStats {
   inputTokens: number
   outputTokens: number
   totalTokens: number
+  todayDate: string
+  todayTokens: number
+  todayInputTokens: number
+  todayCacheReadTokens: number
+  todayCacheWriteTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
   reasoningTokens: number
@@ -291,6 +293,22 @@ function formatDate(value: string | undefined): string {
   if (value === undefined || value === '') return ''
   const date = new Date(value)
   return Number.isFinite(date.getTime()) ? date.toLocaleString() : value
+}
+
+function tokenUsageRow(
+  t: Translate,
+  label: string,
+  totalTokens: number,
+  inputTokens: number,
+  cacheReadTokens: number,
+  cacheWriteTokens: number,
+): ReturnType<typeof h> {
+  const promptTokens = inputTokens + cacheReadTokens + cacheWriteTokens
+  return h('div', { style: { display: 'flex', gap: '6px 16px', flexWrap: 'wrap', alignItems: 'baseline' } },
+    h('span', { title: exactTokenUsage(totalTokens) }, `${label}: ${formatTokenUsage(totalTokens)}`),
+    h('span', { title: `${exactTokenUsage(cacheReadTokens)} / ${exactTokenUsage(promptTokens)}` }, `${t('cacheHitTokens')}: ${formatTokenUsage(cacheReadTokens)}`),
+    h('span', null, `${t('cacheHitRate')}: ${formatCacheHitRate(cacheReadTokens, inputTokens, cacheWriteTokens)}`),
+  )
 }
 
 function iconRefresh(): ReturnType<typeof h> {
@@ -631,14 +649,29 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
       h('div', { style: { display: 'flex', gap: 16, color: colors.secondary, fontSize: 12, flexWrap: 'wrap' } },
         h('span', null, `${displayedPayload?.entries.length ?? 0}${t('count')}`),
         h('span', null, `${t('pending')}: ${displayedPayload?.state.pending ?? 0}`),
-        h('span', null, `${t('checkpoints')}: ${displayedPayload?.state.checkpointCount ?? 0}`),
         h('span', null, `${t('processing')}: ${t(displayedPayload?.state.processing.phase ?? 'idle')}`),
-        h('span', null, `${t('distillCalls')}: ${(displayedPayload?.state.distillation.calls ?? 0).toLocaleString()}`),
-        h('span', null, `${t('failedCalls')}: ${(displayedPayload?.state.distillation.failures ?? 0).toLocaleString()}`),
-        h('span', null, `${t('tokenUsage')}: ${(displayedPayload?.state.distillation.totalTokens ?? 0).toLocaleString()} (${t('inputTokens')} ${(displayedPayload?.state.distillation.inputTokens ?? 0).toLocaleString()} / ${t('outputTokens')} ${(displayedPayload?.state.distillation.outputTokens ?? 0).toLocaleString()})`),
         displayedPayload?.state.processing.nextRunAt !== undefined && h('span', null, `${t('nextRun')}: ${formatDate(displayedPayload.state.processing.nextRunAt)}`),
         displayedPayload?.state.processing.lastSuccessAt !== undefined && h('span', null, `${t('lastSuccess')}: ${formatDate(displayedPayload.state.processing.lastSuccessAt)}`),
       ),
+      view === 'active' && displayedPayload?.scope.kind === 'workspace' && h('div', {
+        style: { display: 'grid', gap: 5, color: colors.secondary, fontSize: 12 },
+      },
+      tokenUsageRow(
+        t,
+        t('todayTokenUsage'),
+        displayedPayload.state.distillation.todayTokens,
+        displayedPayload.state.distillation.todayInputTokens,
+        displayedPayload.state.distillation.todayCacheReadTokens,
+        displayedPayload.state.distillation.todayCacheWriteTokens,
+      ),
+      tokenUsageRow(
+        t,
+        t('totalTokenUsage'),
+        displayedPayload.state.distillation.totalTokens,
+        displayedPayload.state.distillation.inputTokens,
+        displayedPayload.state.distillation.cacheReadTokens,
+        displayedPayload.state.distillation.cacheWriteTokens,
+      )),
       displayedPayload?.state.processing.lastError !== undefined && h('div', { role: 'alert', style: { color: colors.warning, fontSize: 12, overflowWrap: 'anywhere' } }, `${t('lastError')}: ${displayedPayload.state.processing.lastError}`),
       view === 'active' && displayedPayload?.state.processing.phase === 'blocked' && h('button', {
         type: 'button', disabled: mutating, onClick: () => { void retryDistillation() },

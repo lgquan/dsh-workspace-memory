@@ -82,6 +82,33 @@ class CapturingMemoryAdapter extends LlmAdapter {
   }
 }
 
+class HybridMemoryAdapter extends LlmAdapter {
+  readonly requests: GenerateOptions[] = []
+
+  async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
+    this.requests.push(options)
+    const requestText = options.messages.flatMap(message => message.content)
+      .flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
+    if (requestText.includes('<active_memories>')) {
+      yield {
+        type: 'text-delta',
+        index: 0,
+        text: '- 用户画像：现居上海。',
+      }
+      yield { type: 'usage', usage: { inputTokens: 200, outputTokens: 40, totalTokens: 240 } }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+      return
+    }
+    yield {
+      type: 'text-delta',
+      index: 0,
+      text: JSON.stringify({ version: 1, operations: [{ op: 'add', type: 'fact', title: '现居城市', description: '用户现居上海', content: '用户现居上海市。' }] }),
+    }
+    yield { type: 'usage', usage: { inputTokens: 100, outputTokens: 30, totalTokens: 130 } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+}
+
 class ReasoningMemoryAdapter extends CapturingMemoryAdapter {
   constructor(private readonly efforts?: readonly string[]) {
     super()
@@ -200,6 +227,7 @@ test('Cordis adapter distils, stores, recalls, and registers explicit tools', as
   const workspace = join(memoryDir, 'project')
   const ctx = new Context()
   onTestFinished(async () => {
+    await ctx.fiber.dispose()
     await rm(memoryDir, { recursive: true, force: true })
   })
   await ctx.plugin(SessionStore)
@@ -268,10 +296,59 @@ test('Cordis adapter distils, stores, recalls, and registers explicit tools', as
   assert.ok(ctx.tools.get('memory_forget'))
 })
 
+test('builds a validated semantic summary without requiring model JSON or copied source IDs', async () => {
+  const memoryDir = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-semantic-runtime-'))
+  const workspace = join(memoryDir, 'project')
+  const ctx = new Context()
+  onTestFinished(async () => {
+    await ctx.fiber.dispose()
+    await rm(memoryDir, { recursive: true, force: true })
+  })
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(LlmRuntime)
+  const adapter = new HybridMemoryAdapter()
+  ctx.llm.registerAdapter(['hybrid'], adapter)
+  await ctx.plugin(WorkspaceMemoryRuntime, {
+    memoryDir,
+    checkpointTurns: 1,
+    semanticSummaryDelayMs: 10,
+    semanticSummaryIntervalMs: 86_400_000,
+    summarizeProvider: 'hybrid',
+    summarizeModel: 'hybrid',
+  })
+  await flushAsyncWork()
+
+  const memory = ctx.get('workspaceMemory')
+  assert.ok(memory)
+  const result = await memory.checkpoint({
+    cwd: workspace,
+    reason: 'task-end',
+    force: true,
+    messages: [{ id: 'u-semantic', role: 'user', text: '请记住我现在住在上海。' }],
+  })
+  assert.equal(result.status, 'committed')
+
+  const store = new WorkspaceMemoryStore(memoryDir)
+  const scope = store.scope(workspace)
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if ((await store.readSummaryMetadata(scope))?.mode === 'semantic') break
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  assert.equal(adapter.requests.length, 2)
+  const metadata = await store.readSummaryMetadata(scope)
+  assert.equal(metadata?.mode, 'semantic')
+  assert.equal(metadata?.sourceIds?.length, 1)
+  assert.match(await store.readSummary(scope), /用户画像：现居上海/u)
+  const state = await store.readState(scope)
+  assert.equal(state.distillation.calls, 2)
+  assert.equal(state.distillation.totalTokens, 370)
+})
+
 test('recovers an overdue pending scope when the runtime starts', async () => {
   const memoryDir = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-recovery-'))
   const workspace = join(memoryDir, 'project')
   onTestFinished(async () => {
+    await ctx.fiber.dispose()
     await rm(memoryDir, { recursive: true, force: true })
   })
   const seedStore = new WorkspaceMemoryStore(memoryDir)
@@ -311,6 +388,7 @@ test('retries one invalid JSON response inside the same checkpoint', async () =>
   const memoryDir = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-retry-'))
   const workspace = join(memoryDir, 'project')
   onTestFinished(async () => {
+    await ctx.fiber.dispose()
     await rm(memoryDir, { recursive: true, force: true })
   })
   const ctx = new Context()
@@ -387,6 +465,11 @@ test('splits a max-token distillation once and records actual token usage', asyn
     inputTokens: 180,
     outputTokens: 1540,
     totalTokens: 1720,
+    todayDate: state.distillation.todayDate,
+    todayTokens: 1720,
+    todayInputTokens: 180,
+    todayCacheReadTokens: 0,
+    todayCacheWriteTokens: 0,
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
     reasoningTokens: 0,
@@ -445,6 +528,7 @@ test('queues derived DSH 0.2.2 messages without re-distilling recalled memory', 
   const ctx = new Context()
   const adapter = new CapturingMemoryAdapter()
   onTestFinished(async () => {
+    await ctx.fiber.dispose()
     await rm(memoryDir, { recursive: true, force: true })
   })
   await ctx.plugin(SessionStore)
@@ -467,6 +551,12 @@ test('queues derived DSH 0.2.2 messages without re-distilling recalled memory', 
     content: [{ type: 'text', text: '这段召回内容不能再次进入蒸馏。' }],
     source: { kind: 'workspace-memory' },
   }), { surfaceOp: 'append' })
+  for (const kind of ['agent-instructions', 'runtime-context', 'skill-catalog', 'time-context'] as const) {
+    session.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: `运行时注入 ${kind} 不能进入蒸馏。` }],
+      source: { kind } as never,
+    }), { surfaceOp: 'append' })
+  }
   session.append('user/message', createUserMessage({
     content: [{ type: 'text', text: '请记住新版会话事件已经兼容。' }],
     source: { kind: 'user' },
@@ -485,6 +575,7 @@ test('queues derived DSH 0.2.2 messages without re-distilling recalled memory', 
     .join('\n')
   assert.match(requestText, /请记住新版会话事件已经兼容/u)
   assert.doesNotMatch(requestText, /这段召回内容不能再次进入蒸馏/u)
+  assert.doesNotMatch(requestText, /运行时注入/u)
   const memory = ctx.get('workspaceMemory')
   assert.ok(memory)
   const recalled = await memory.recall({ sessionId: session.id, query: '新版会话事件' })
@@ -505,6 +596,7 @@ test('resolves a persisted DSH 0.2.2 session workspace through stat()', async ()
 
   const ctx = new Context()
   onTestFinished(async () => {
+    await ctx.fiber.dispose()
     await rm(memoryDir, { recursive: true, force: true })
   })
   await ctx.plugin(SessionStore)
@@ -526,6 +618,7 @@ test('uses the configured fixed memory model', async () => {
   const ctx = new Context()
   const adapter = new CapturingMemoryAdapter()
   onTestFinished(async () => {
+    await ctx.fiber.dispose()
     await rm(memoryDir, { recursive: true, force: true })
   })
   await ctx.plugin(SessionStore)
@@ -712,6 +805,7 @@ test('limits concurrent memory distillations across workspaces', async () => {
   const adapter = new BlockingMemoryAdapter()
   onTestFinished(async () => {
     adapter.release()
+    await ctx.fiber.dispose()
     await rm(memoryDir, { recursive: true, force: true })
   })
   await ctx.plugin(SessionStore)
@@ -766,6 +860,7 @@ test('browser API exposes Host workspace titles and the routable model catalog',
   await store.rebuildSummary(scope, await store.readEntries(scope), 3000)
   const ctx = new Context()
   onTestFinished(async () => {
+    await ctx.fiber.dispose()
     await rm(memoryDir, { recursive: true, force: true })
   })
   await ctx.plugin(SessionStore)
@@ -800,9 +895,10 @@ test('browser API exposes Host workspace titles and the routable model catalog',
 
   const scopeResponse = await requestJson(scopeHandler, `/workspace-memory/api/v1/scope?cwd=${encodeURIComponent(workspace)}`)
   assert.equal(scopeResponse.status, 200)
-  const scopePayload = scopeResponse.body as { state: { distillation: { calls: number; totalTokens: number; blocked: boolean } } }
+  const scopePayload = scopeResponse.body as { state: { distillation: { calls: number; totalTokens: number; todayTokens: number; blocked: boolean } } }
   assert.equal(scopePayload.state.distillation.calls, 0)
   assert.equal(scopePayload.state.distillation.totalTokens, 0)
+  assert.equal(scopePayload.state.distillation.todayTokens, 0)
   assert.equal(scopePayload.state.distillation.blocked, false)
 
   const retryResponse = await requestJson(retryHandler, `/workspace-memory/api/v1/retry?cwd=${encodeURIComponent(workspace)}`, 'POST')
