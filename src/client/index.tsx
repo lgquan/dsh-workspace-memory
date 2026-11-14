@@ -524,6 +524,8 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
     surface: 'var(--dsw-alias-bg-layer-2, #f7f8fa)',
     elevated: 'var(--dsw-alias-bg-layer-3, #ffffff)',
     accent: 'var(--dsw-alias-brand-primary, #4f6ef7)',
+    primaryFill: 'var(--dsw-alias-button-primary-fill, var(--dsw-alias-label-primary, #1f2328))',
+    onPrimary: 'var(--dsw-alias-label-primary-foreground, var(--dsw-alias-bg-layer-3, #fff))',
     warning: 'var(--dsw-alias-state-warn-primary, #b45309)',
     danger: 'var(--dsw-alias-state-error-primary, #dc2626)',
   }
@@ -633,7 +635,7 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
                   ),
                 ),
                 h('div', { style: { display: 'flex', gap: 8 } },
-                  h('button', { type: 'button', disabled: mutating, onClick: () => { void saveEntry() }, style: { padding: '7px 11px', color: '#fff', background: colors.accent, border: 0, borderRadius: 6, cursor: 'pointer' } }, t('save')),
+                  h('button', { type: 'button', disabled: mutating, onClick: () => { void saveEntry() }, style: { padding: '7px 11px', color: colors.onPrimary, background: colors.primaryFill, border: 0, borderRadius: 6, cursor: 'pointer' } }, t('save')),
                   h('button', { type: 'button', disabled: mutating, onClick: () => setEditDraft(undefined), style: { padding: '7px 11px', color: colors.text, background: 'transparent', border: `1px solid ${colors.border}`, borderRadius: 6, cursor: 'pointer' } }, t('cancel')),
                 ),
               )
