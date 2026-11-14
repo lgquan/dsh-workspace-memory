@@ -3,8 +3,8 @@
 ## 1. 定位
 
 `dsh-workspace-memory` 为 DeepSeek Harness 提供可持久化、按项目隔离的长期记忆。
-它同时服务普通 Session、后台 Agent 和可选的 `dsh-voco` 语音 Agent；这些调用方
-只依赖 `WorkspaceMemory` 接口，不共享存储实现细节。
+它同时服务普通 Session 和后台 Agent；这些调用方只依赖 `WorkspaceMemory` 接口，
+不共享存储实现细节。
 
 目标是让 Agent 在后续任务中记住稳定的项目事实、决策、约定和用户偏好，同时保持
 记忆可浏览、可审计、可删除。当前版本不引入向量数据库、Embedding 或 BM25。
@@ -63,7 +63,7 @@ interface WorkspaceMemory {
 }
 ```
 
-此外，运行时提供 `remember`、`forget` 和 `search` 能力供显式记忆工具使用。调用方
+此外，运行时提供 `remember`、`update`、`forget` 和 `search` 能力供显式记忆工具与设置页使用。调用方
 不能直接操作 JSON 文件；这样可以统一处理去重、敏感信息过滤和并发写入。
 
 ## 5. 数据流
@@ -80,20 +80,6 @@ interface WorkspaceMemory {
 
 两者均从 Session 的 `cwd` 解析项目 scope。后台 Agent 继承来源 `cwd`，因此无需单独
 的记忆目录，也不会把不同项目的事实混在一起。
-
-### dsh-voco
-
-语音前台在路由前可调用同一个 `workspaceMemory.recall`，将结果作为带边界的参考材料
-提供给路由器。前台默认最多等待 250 毫秒，超时后以空记忆继续路由；后台 Agent 仍会在首个
-step 独立检索同一项目记忆。完成的语音 utterance 进入同一 checkpoint 策略，Session 关闭时强制评估
-最后一阶段。
-
-`dsh-voco` `0.3.6` 起，每个完成的 frontend-agent 委派任务还会使用子 Session ID 提交
-`task-end` checkpoint。输入只包含 Voco 持有的用户原始请求（含已接受的补充要求）和最终可见结果，
-不包含 reasoning、工具日志、runtime context、workspace memory 注入或轮换 handoff。子 Session 继承
-主语音 Session 的 `cwd`，因此多个子 Session 与主会话自然进入同一个 workspace scope；任务 ID 派生的
-稳定消息 ID 与记忆引擎的 seen-message 机制共同保证重复终止事件幂等。取消、失败、等待用户继续的
-中间状态不作为稳定事实提交。服务不存在或调用失败时，Voco 保持原有行为。
 
 ## 6. 阶段性 checkpoint
 
@@ -129,14 +115,15 @@ Web 设置的“记忆”页面从全局 scope 列表中选择任意项目，而
 摘要、结构化条目和整理计数。删除项目时只移动其 scope 目录，便于误删后的人工保留；
 “永久删除”需确认，并物理删除归档目录及其 checkpoint、摘要历史，操作不可恢复。
 
-前端只能通过 Host 的只读读取路由访问脱敏数据，不能直接读写存储文件，也不会展示完整
-checkpoint 原文。全局记忆不随项目删除而改变。
+前端通过 Host 路由访问脱敏数据，不能直接读写存储文件，也不会展示完整 checkpoint 原文。
+单条编辑和删除必须经过记忆引擎，以保留旧版本、执行敏感信息检查、串行写入并立即重建摘要。
+全局记忆不随项目删除而改变。
 
 ## 9. 安全与降级
 
 - 凭据形态内容默认拒绝持久化，召回前再次脱敏。
 - 记忆以不可信参考资料注入，不能覆盖当前用户指令。
-- 解析失败、存储失败、检索失败或蒸馏失败只记录日志，不阻断 Agent 或语音回复。
+- 解析失败、存储失败、检索失败或蒸馏失败只记录日志，不阻断 Agent 回复。
 - checkpoint 输入有硬性字节上限，scope 写入串行化以避免并发覆盖；recall 使用写入后失效的
   不可变内存快照，不进入写锁队列。
 

@@ -5,7 +5,7 @@ import { test } from 'vitest'
 
 const root = join(import.meta.dirname, '..')
 
-test('declares the DSH 0.2.1 runtime contract', async () => {
+test('declares the DSH 0.2.2 runtime contract', async () => {
   const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8')) as {
     peerDependencies?: Record<string, string>
     devDependencies?: Record<string, string>
@@ -17,13 +17,13 @@ test('declares the DSH 0.2.1 runtime contract', async () => {
 
   assert.ok(dshPeers.length > 0)
   for (const [name, range] of dshPeers) {
-    assert.equal(range, '^0.2.1-rc.2', `${name} peer must target the DSH 0.2.1 contract`)
-    assert.equal(dev[name], '0.2.1-rc.2', `${name} development dependency must pin the tested runtime`)
+    assert.equal(range, '^0.2.2-rc.1', `${name} peer must target the DSH 0.2.2 contract`)
+    assert.equal(dev[name], '0.2.2-rc.1', `${name} development dependency must pin the tested runtime`)
   }
   assert.equal(peers['@deepseek-ai/dsh-client-runtime'], undefined)
   assert.equal(dev['@deepseek-ai/dsh-client-runtime'], undefined)
-  assert.equal(peers['@deepseek-ai/dsh-client-ui-slots'], '^0.2.1-rc.2')
-  assert.equal(dev['@deepseek-ai/dsh-client-ui-slots'], '0.2.1-rc.2')
+  assert.equal(peers['@deepseek-ai/dsh-client-ui-slots'], '^0.2.2-rc.1')
+  assert.equal(dev['@deepseek-ai/dsh-client-ui-slots'], '0.2.2-rc.1')
   assert.ok(pkg.dsh?.client?.inject?.includes('@deepseek-ai/dsh-client-locale'))
   assert.ok(pkg.dsh?.client?.inject?.includes('@deepseek-ai/dsh-client-ui-settings'))
   assert.ok(!pkg.dsh?.client?.inject?.includes('@deepseek-ai/dsh-client-runtime'))

@@ -7,13 +7,13 @@
 ## 适合谁
 
 - 希望同一项目的多个 Session 共享上下文；
-- 希望普通 Agent、后台 Agent 和语音 Agent 使用同一份项目记忆；
+- 希望普通 Agent 和后台 Agent 使用同一份项目记忆；
 - 希望长期记忆可查看、可纠错、可删除，而不是无法审计的黑盒；
 - 不想额外部署向量数据库或 Embedding 服务。
 
 ## 安装前提
 
-- 已安装 DeepSeek Harness `0.2.1-rc.2` 或兼容的更新版本；
+- 已安装 DeepSeek Harness `0.2.2-rc.1` 或兼容的更新版本；
 - 使用 DSH 的 `web` profile；
 - Node.js `>= 22.19.0`。
 
@@ -49,8 +49,12 @@ Release 页面：[v0.2.16](https://github.com/lgquan/dsh-workspace-memory/releas
 安装成功后，设置页会显示：
 
 - 全局记忆和各项目记忆；
+- 与 DSH 工作区列表同步的项目显示名称；
+- 可固定选择的记忆整理模型及其可用状态；
+- 待整理队列、下次运行、上次成功和最近错误；
 - 自动生成的稳定摘要；
 - 可展开查看的结构化记忆；
+- 可直接编辑或删除的单条记忆；
 - 记忆状态、历史修订和冲突信息；
 - 已删除项目对应的记忆回收区。
 
@@ -97,18 +101,26 @@ dsh plugin --profile web remove --config.minimumReleaseAge=0 @flowingspring/dsh-
 
 ## 记忆什么时候整理
 
-对话完成后，消息会先进入缓冲区，不会每轮都调用模型整理。出现以下任一情况时会评估 checkpoint：
+普通对话完成后，消息会立即持久化到缓冲区，并在默认 15 秒合并窗口后进入后台整理。短窗口会把同一项目连续产生的消息合并，避免对流式片段或紧邻轮次逐条调用模型。前台回答不等待整理完成。
+
+后台 Agent 任务结束、Session 关闭或调用方显式要求时仍会立即评估 checkpoint。批处理调用方还可以使用以下条件：
 
 - 后台 Agent 任务完成；
 - 累计达到 10 个已完成用户轮次；
 - 缓冲内容达到 4000 个字符；
-- 连续空闲 5 分钟；
+- 连续空闲 5 分钟（批处理兼容策略）；
 - Session 关闭；
 - 调用方显式要求立即整理。
 
-插件会在服务启动时恢复已有项目的待整理消息：已经超过空闲阈值的内容会立即尝试整理，尚未超时的内容会按剩余时间触发。若模型或网络导致一次整理失败，插件会自动使用退避间隔重试，并在成功提交前保留待整理消息。
+插件在 DSH 服务运行期间持续处理后台队列，默认全局最多同时发起一个整理请求。它会在服务启动时恢复已有项目的待整理消息，并在最长 15 秒内重新调度。若模型或网络导致一次整理失败，插件会自动使用退避间隔重试，并在成功提交前保留待整理消息。
 
-因此，刚聊完但尚未达到阈值、没有空闲足够时间或 Session 仍在继续时，设置页里暂时看不到新记忆是正常现象。
+因此，刚结束对话后的短暂窗口内只看到“待整理”是正常现象；设置页会同时显示计划、排队、整理和重试状态。DSH 服务停止时不会在独立进程中继续调用模型，重新启动后会恢复处理。
+
+## 记忆整理模型
+
+设置页的“记忆整理模型”可以从 DSH 当前可路由的全部 provider/model 中固定选择一个专用模型。默认固定使用 DSH 账户的 `deepseek-account / deepseek-flash`。该选择独立于具体工作区和 Session 的对话模型；工作区对话切换模型不会改变记忆整理模型。
+
+选定模型被删除或暂时不可用时，插件不会静默回退到其他模型，待整理内容会保留并重试，设置页会明确显示不可用状态。
 
 ## 记忆如何检索和纠错
 
@@ -119,6 +131,8 @@ dsh plugin --profile web remove --config.minimumReleaseAge=0 @flowingspring/dsh-
 - `memory_forget` 可以按记忆 ID 删除条目。
 
 明确的用户纠正可以取代旧事实；证据不足的矛盾不会静默覆盖，而会保留为显式冲突。修订前的内容和被取代条目继续保留用于审计，但不会作为有效事实进入稳定摘要。
+
+在设置页展开一条活动记忆后，可以直接编辑标题、说明、内容、标签、类型和重要度，也可以删除该条记忆。手工编辑会保存旧版本并立即重建摘要；删除采用可审计的软删除，该条目会立即退出召回和摘要。
 
 ## 数据存在哪里
 
@@ -136,12 +150,6 @@ $DSH_HOME/workspace-memory
 
 记忆数据默认不会写入 Git 项目目录。设置页只能读取经过脱敏的摘要和结构化条目，不会展示完整 checkpoint 对话原文。
 
-## 与 dsh-voco 一起使用
-
-安装 [`dsh-voco`](https://github.com/lgquan/dsh-voco#readme) `0.3.6` 或更高版本后，语音主 Session、普通 Session 和语音委派子 Session 只要使用相同的工作目录，就会共享同一个项目记忆范围。每个完成的语音委派任务会以 `task-end` 触发整理；只提交用户原始请求和最终可见结果，不把 reasoning、工具日志或注入上下文保存为长期记忆。
-
-`dsh-voco` 不是必需依赖。未安装语音插件时，`dsh-workspace-memory` 仍可独立服务普通 DSH Agent。
-
 ## 可选配置
 
 默认配置已经可以直接使用。需要调整时，可以在插件 loader 配置中覆盖以下字段：
@@ -155,6 +163,8 @@ $DSH_HOME/workspace-memory
         checkpointTurns: 10
         checkpointChars: 4000
         idleCheckpointMs: 300000
+        processingDelayMs: 15000
+        maxConcurrentDistillations: 1
         consolidateEvery: 5
         summaryMaxBytes: 3000
         recallMaxBytes: 5000
@@ -162,11 +172,13 @@ $DSH_HOME/workspace-memory
         checkpointMaxChars: 40000
         keepSummaryVersions: 10
         surfacedPenalty: 8
-        summarizeProvider: ''
-        summarizeModel: ''
+        summarizeProvider: deepseek-account
+        summarizeModel: deepseek-flash
 ```
 
-`summarizeProvider` 和 `summarizeModel` 留空时，使用 DSH 当前默认模型。
+`summarizeProvider` 和 `summarizeModel` 默认固定为 DSH 账户的 Flash 模型，也可以直接在设置页选择其他当前可用模型。
+
+`processingDelayMs` 是普通对话完成后的合并窗口；`maxConcurrentDistillations` 是跨工作区同时整理的最大请求数。通常保留默认值即可。整理模型建议直接在设置页选择，避免手工填写 provider/model 标识。
 
 ## 常见问题
 
@@ -176,7 +188,7 @@ $DSH_HOME/workspace-memory
 
 ### 刚结束对话，为什么还没有新记忆
 
-整理由任务完成、轮次、字符数、空闲时间或 Session 关闭触发。未达到任何条件时，内容仍在 checkpoint 缓冲区中。
+普通对话默认在完成后等待 15 秒合并窗口再进入后台队列。若长时间停留在待整理、排队或重试状态，可在记忆设置页查看最近错误，并确认固定模型和对应 provider 可用。
 
 ### 为什么某些聊天内容没有保存
 

@@ -3,8 +3,8 @@
 ## Goal
 
 Provide durable, workspace-scoped memory for DeepSeek Harness while remaining
-independent from any particular UI or voice plugin. Ordinary DSH Agents and
-`dsh-voco` share the same memory whenever their Sessions have the same `cwd`.
+independent from any particular UI. DSH Agents share the same memory whenever
+their Sessions have the same `cwd`.
 
 The plugin owns memory. Callers only cross the `WorkspaceMemory` seam.
 
@@ -25,7 +25,7 @@ interface WorkspaceMemory {
 - Missing/empty `cwd` resolves to the global scope.
 - A project scope recalls both global and workspace entries; writes may be classified
   as `global` or `workspace` by the distiller.
-- Failure to recall memory never prevents an Agent or voice response.
+- Failure to recall memory never prevents an Agent response.
 
 The production adapter is the Cordis `workspaceMemory` service. Tests use an
 in-memory/fake adapter at the same seam.
@@ -91,8 +91,11 @@ as reference data and never as an instruction overriding the current user.
 
 ## Checkpoint policy
 
-A stage is logical, not hourly. A checkpoint becomes eligible when any of the
-following is true:
+A stage is logical, not hourly. Completed foreground turns are persisted first
+and scheduled for distillation after `processingDelayMs` (default 15 seconds).
+The short debounce merges adjacent activity without delaying the foreground
+response. Explicit and task-end checkpoints remain immediately eligible. Batch
+callers may also become eligible when any of the following is true:
 
 - a background Agent turn/task completes;
 - at least `checkpointTurns` completed user turns are buffered (default 10);
@@ -101,7 +104,10 @@ following is true:
 - the Session closes or a caller explicitly forces a checkpoint.
 
 Only completed messages enter the buffer. Checkpointing is asynchronous from
-Agent/voice response delivery. A scope queue prevents concurrent mutations.
+Agent/voice response delivery. A scope queue prevents concurrent mutations, and
+a bounded runtime queue limits cross-scope model work to
+`maxConcurrentDistillations` (default 1). Pending messages are durable, restored
+on service startup, and retried with exponential backoff after failures.
 
 The distiller receives a bounded set of relevant existing entries and emits
 versioned operations: add, revise, supersede, or flag-conflict. Explicit user
@@ -120,17 +126,18 @@ facts cannot remain injected. `consolidateEvery` successful checkpoints (default
 - `systemPrompt.context` injects the stable summary on every Agent step.
 - `agent/pre-step` calls `recall` for the current user message and appends only
   relevant entries on step 1.
-- `agent/turn-stopping` submits the completed turn to the checkpoint buffer
-  without forcing an LLM distillation; threshold, idle, task-end, and close
-  policy decides when a stage is ready.
+- `agent/turn-stopping` persists the completed turn without invoking the LLM in
+  the foreground path, then schedules it through the short debounce window.
 - memory tools provide explicit search, remember, and forget operations.
 - `memory_search` remains the Agentic second-search seam: an Agent can issue
   alternate queries when the automatic first recall is insufficient.
 
 ### Settings memory browser
 
-The Web client contributes a top-level `settings.section` named `记忆`. It reads
-the same store through two loopback, read-only Host routes:
+The Web client contributes a top-level `settings.section` named `记忆`. Active
+workspace labels come from the Host `WorkspaceRegistry.title`, while normalized
+`cwd` remains the stable memory identity. Duplicate labels include the path for
+disambiguation. The page reads the same store through loopback Host routes:
 
 - `GET /workspace-memory/api/v1/scopes` lists the global scope and persisted
   workspace descriptors.
@@ -140,24 +147,21 @@ the same store through two loopback, read-only Host routes:
   recoverable archive.
 - `GET /workspace-memory/api/v1/archived-scope?key=...` reads one archived
   scope, and `DELETE` permanently purges it after UI confirmation.
+- `GET /workspace-memory/api/v1/settings` returns the routable DSH model catalog
+  and current fixed memory route; `PUT` persists a provider/model pair through
+  DSH settings.
+- `PUT /workspace-memory/api/v1/entry?cwd=...&id=...` performs a versioned manual
+  edit, and `DELETE` soft-deletes one active entry. Both operations rebuild the
+  affected stable summary immediately.
+
+The fixed memory route is independent from Session model selection. An
+unavailable fixed route remains selected and visible; distillation fails and
+retries without silently falling back. The initial route is
+`deepseek-account/deepseek-flash`.
 
 The browser never opens checkpoint Markdown or writes the JSON files directly.
 Mutations continue to go through the memory engine so its per-scope locks,
 deduplication, secret checks, and atomic writes remain authoritative.
-
-## Voco integration
-
-- Before frontend routing, Voco optionally calls `workspaceMemory.recall` with a
-  short soft deadline (250 ms by default). A slow or failed recall is treated as
-  empty reference data so the frontend router can continue; the delegated Agent
-  still performs its own first-step retrieval.
-- The returned context is included as quoted reference material for the router.
-- Completed voice utterances are submitted to `checkpoint`; policy remains
-  inside the memory module.
-- Voice Session close forces a final evaluation of the buffered stage.
-- If the service is absent or fails, Voco uses its existing behavior unchanged.
-- Delegated background Agents already inherit the source `cwd`, so they resolve
-  the same workspace scope without a Voco-specific storage path.
 
 ## Safety and failure behavior
 
@@ -165,7 +169,7 @@ deduplication, secret checks, and atomic writes remain authoritative.
   redacted from recall output.
 - Malformed LLM output leaves the store unchanged.
 - Memory I/O, retrieval, or distillation failure is logged and never fails the
-  foreground Agent/voice operation.
+  foreground Agent operation.
 - Checkpoint input has a hard byte cap.
 - Memory context is clearly delimited and labelled as untrusted reference data.
 
@@ -176,6 +180,6 @@ deduplication, secret checks, and atomic writes remain authoritative.
 3. Exact, ASCII-token, and Chinese-bigram queries return ranked entries.
 4. Repeated checkpoint messages are deduplicated by message id.
 5. Threshold, idle, task-end, and close triggers are deterministic in tests.
-6. Voco behaves exactly as before when `workspaceMemory` is unavailable.
-7. A Voco frontend query receives bounded memory when it is available.
+6. Manual edits retain the prior revision and immediately rebuild the summary.
+7. Manual deletes immediately remove an entry from recall and the summary.
 8. Core store/retrieval tests require no running DSH process or remote model.

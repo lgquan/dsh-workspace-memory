@@ -37,6 +37,37 @@ const zh = {
   superseded: '已被取代',
   deleted: '已删除',
   revisions: '历史版本',
+  modelTitle: '记忆整理模型',
+  modelUnavailable: '已选模型当前不可用',
+  modelSaving: '正在保存',
+  modelFailed: '模型设置读取或保存失败',
+  processing: '后台状态',
+  idle: '空闲',
+  scheduled: '已计划',
+  queued: '排队中',
+  running: '整理中',
+  retrying: '等待重试',
+  nextRun: '下次运行',
+  lastSuccess: '上次成功',
+  lastError: '最近错误',
+  edit: '编辑',
+  delete: '删除',
+  save: '保存',
+  cancel: '取消',
+  deleteConfirm: '确定删除这条记忆吗？删除后它将不再参与召回和摘要。',
+  mutationFailed: '记忆更新或删除失败',
+  titleLabel: '标题',
+  descriptionLabel: '说明',
+  contentLabel: '内容',
+  tagsLabel: '标签',
+  typeLabel: '类型',
+  importanceLabel: '重要度',
+  typePreference: '偏好（preference）',
+  typeDecision: '决策（decision）',
+  typeArchitecture: '架构（architecture）',
+  typeRule: '规则（rule）',
+  typeFact: '事实（fact）',
+  typeFix: '修复（fix）',
 }
 
 const en = {
@@ -71,6 +102,37 @@ const en = {
   superseded: 'Superseded',
   deleted: 'Deleted',
   revisions: 'Previous revisions',
+  modelTitle: 'Memory distillation model',
+  modelUnavailable: 'Selected model is currently unavailable',
+  modelSaving: 'Saving',
+  modelFailed: 'Unable to load or save model settings',
+  processing: 'Background status',
+  idle: 'Idle',
+  scheduled: 'Scheduled',
+  queued: 'Queued',
+  running: 'Distilling',
+  retrying: 'Waiting to retry',
+  nextRun: 'Next run',
+  lastSuccess: 'Last success',
+  lastError: 'Last error',
+  edit: 'Edit',
+  delete: 'Delete',
+  save: 'Save',
+  cancel: 'Cancel',
+  deleteConfirm: 'Delete this memory? It will no longer appear in recall or summaries.',
+  mutationFailed: 'Unable to update or delete memory',
+  titleLabel: 'Title',
+  descriptionLabel: 'Description',
+  contentLabel: 'Content',
+  tagsLabel: 'Tags',
+  typeLabel: 'Type',
+  importanceLabel: 'Importance',
+  typePreference: 'Preference (preference)',
+  typeDecision: 'Decision (decision)',
+  typeArchitecture: 'Architecture (architecture)',
+  typeRule: 'Rule (rule)',
+  typeFact: 'Fact (fact)',
+  typeFix: 'Fix (fix)',
 }
 
 type Translate = (key: keyof typeof zh) => string
@@ -84,6 +146,17 @@ interface ScopeInfo {
   pending: number
   checkpointCount: number
   updatedAt?: string
+  title?: string
+  workspaceId?: string
+  processing: ProcessingInfo
+}
+
+interface ProcessingInfo {
+  phase: 'idle' | 'scheduled' | 'queued' | 'running' | 'retrying'
+  nextRunAt?: string
+  runningSince?: string
+  lastSuccessAt?: string
+  lastError?: string
 }
 
 interface MemoryEntry {
@@ -108,7 +181,43 @@ interface ScopePayload {
   scope: { key: string; cwd: string; kind: 'global' | 'workspace' }
   summary: string
   entries: MemoryEntry[]
-  state: { pending: number; checkpointCount: number; lastCheckpointAt: number }
+  state: { pending: number; checkpointCount: number; lastCheckpointAt: number; processing: ProcessingInfo }
+}
+
+interface ModelSettings {
+  selection: { provider: string; model: string }
+  available: boolean
+  writable: boolean
+  catalog: {
+    groups: Array<{ id: string; name: string; models: Array<{ id: string; name: string; description?: string }> }>
+    failures: Array<{ id: string; name: string; message: string }>
+  }
+}
+
+interface EditDraft {
+  id: string
+  title: string
+  description: string
+  content: string
+  tags: string
+  type: string
+  importance: number
+}
+
+const memoryTypes = ['preference', 'decision', 'architecture', 'rule', 'fact', 'fix'] as const
+type MemoryType = typeof memoryTypes[number]
+
+const memoryTypeKeys: Record<MemoryType, keyof typeof zh> = {
+  preference: 'typePreference',
+  decision: 'typeDecision',
+  architecture: 'typeArchitecture',
+  rule: 'typeRule',
+  fact: 'typeFact',
+  fix: 'typeFix',
+}
+
+function memoryTypeLabel(t: Translate, type: string): string {
+  return memoryTypes.includes(type as MemoryType) ? t(memoryTypeKeys[type as MemoryType]) : type
 }
 
 type MemoryView = 'active' | 'archived'
@@ -135,6 +244,18 @@ function workspaceName(cwd: string, fallback: string): string {
   return name ?? fallback
 }
 
+function workspaceLabel(scope: ScopeInfo, scopes: readonly ScopeInfo[], fallback: string): string {
+  if (scope.kind === 'global') return fallback
+  const base = scope.title?.trim() || workspaceName(scope.cwd, fallback)
+  const duplicates = scopes.filter(candidate => candidate.kind === 'workspace'
+    && (candidate.title?.trim() || workspaceName(candidate.cwd, fallback)) === base)
+  return duplicates.length > 1 ? `${base} — ${scope.cwd}` : base
+}
+
+function modelValue(selection: ModelSettings['selection'] | undefined): string {
+  return selection === undefined ? '' : JSON.stringify([selection.provider, selection.model])
+}
+
 function formatDate(value: string | undefined): string {
   if (value === undefined || value === '') return ''
   const date = new Date(value)
@@ -159,6 +280,12 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
   const [query, setQuery] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(false)
+  const [modelSettings, setModelSettings] = useState<ModelSettings>()
+  const [modelSaving, setModelSaving] = useState(false)
+  const [modelError, setModelError] = useState(false)
+  const [editDraft, setEditDraft] = useState<EditDraft>()
+  const [mutating, setMutating] = useState(false)
+  const [mutationError, setMutationError] = useState(false)
 
   const loadScopes = async (): Promise<ScopeInfo[]> => {
     const response = await fetch('/workspace-memory/api/v1/scopes')
@@ -184,6 +311,12 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
     const response = await fetch(`/workspace-memory/api/v1/archived-scope?key=${encodeURIComponent(key)}`)
     if (!response.ok) throw new Error(`archived scope read failed (${response.status})`)
     return await response.json() as ScopePayload
+  }
+
+  const loadModelSettings = async (): Promise<ModelSettings> => {
+    const response = await fetch('/workspace-memory/api/v1/settings')
+    if (!response.ok) throw new Error(`memory settings read failed (${response.status})`)
+    return await response.json() as ModelSettings
   }
 
   const reload = async (cwd?: string): Promise<void> => {
@@ -226,9 +359,26 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
 
   useEffect(() => {
     void reload()
+    void loadModelSettings().then(settings => {
+      setModelSettings(settings)
+      setModelError(false)
+    }, () => setModelError(true))
     // Memory browsing is independent from the currently open session.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  useEffect(() => {
+    const timer = globalThis.setInterval(() => {
+      void loadScopes().then(nextScopes => {
+        setScopes(nextScopes)
+        const current = nextScopes.find(scope => scope.key === selectedKey)
+        if (current !== undefined) void loadScope(current.cwd).then(setPayload, () => {})
+      }, () => {})
+    }, 5000)
+    return () => globalThis.clearInterval(timer)
+    // Workspace titles and background state can change while this page is open.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedKey])
 
   const options = useMemo(() => {
     const known = new Map(scopes.map(scope => [scope.key, scope]))
@@ -240,6 +390,10 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
   const displayedPayload = view === 'active' ? payload : archivedPayload
   const displayedOptions = view === 'active' ? options : archivedOptions
   const displayedKey = view === 'active' ? selectedKey : archivedSelectedKey
+  const selectedModelValue = modelValue(modelSettings?.selection)
+  const unavailableSelection = modelSettings !== undefined && modelSettings.available === false
+    ? modelSettings.selection
+    : undefined
 
   const filteredEntries = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase()
@@ -281,6 +435,87 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
     }
   }
 
+  const saveModel = async (value: string): Promise<void> => {
+    const parsed = JSON.parse(value) as unknown
+    if (!Array.isArray(parsed) || typeof parsed[0] !== 'string' || typeof parsed[1] !== 'string') return
+    const [provider, model] = parsed
+    setModelSaving(true)
+    setModelError(false)
+    try {
+      const response = await fetch('/workspace-memory/api/v1/settings', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ provider, model }),
+      })
+      if (!response.ok) throw new Error(`memory settings write failed (${response.status})`)
+      setModelSettings(await response.json() as ModelSettings)
+    } catch {
+      setModelError(true)
+    } finally {
+      setModelSaving(false)
+    }
+  }
+
+  const beginEdit = (entry: MemoryEntry): void => {
+    setMutationError(false)
+    setEditDraft({
+      id: entry.id,
+      title: entry.title,
+      description: entry.description,
+      content: entry.content,
+      tags: entry.tags.join(', '),
+      type: entry.type,
+      importance: entry.importance,
+    })
+  }
+
+  const saveEntry = async (): Promise<void> => {
+    if (editDraft === undefined || displayedPayload === undefined || view !== 'active') return
+    setMutating(true)
+    setMutationError(false)
+    try {
+      const query = new URLSearchParams({ cwd: displayedPayload.scope.cwd, id: editDraft.id })
+      const response = await fetch(`/workspace-memory/api/v1/entry?${query.toString()}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          title: editDraft.title,
+          description: editDraft.description,
+          content: editDraft.content,
+          tags: editDraft.tags.split(/[,，]/u).map(tag => tag.trim()).filter(Boolean),
+          type: editDraft.type,
+          importance: editDraft.importance,
+        }),
+      })
+      if (!response.ok) throw new Error(`memory update failed (${response.status})`)
+      setEditDraft(undefined)
+      await reload(displayedPayload.scope.cwd)
+    } catch {
+      setMutationError(true)
+    } finally {
+      setMutating(false)
+    }
+  }
+
+  const deleteEntry = async (entry: MemoryEntry): Promise<void> => {
+    if (displayedPayload === undefined || view !== 'active') return
+    const confirm = (globalThis as unknown as { confirm?: (message: string) => boolean }).confirm
+    if (confirm !== undefined && !confirm(t('deleteConfirm'))) return
+    setMutating(true)
+    setMutationError(false)
+    try {
+      const query = new URLSearchParams({ cwd: displayedPayload.scope.cwd, id: entry.id })
+      const response = await fetch(`/workspace-memory/api/v1/entry?${query.toString()}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(`memory delete failed (${response.status})`)
+      if (editDraft?.id === entry.id) setEditDraft(undefined)
+      await reload(displayedPayload.scope.cwd)
+    } catch {
+      setMutationError(true)
+    } finally {
+      setMutating(false)
+    }
+  }
+
   const colors = {
     text: 'var(--dsw-alias-label-primary, #1f2328)',
     secondary: 'var(--dsw-alias-label-secondary, #6b7280)',
@@ -309,6 +544,25 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
       h('button', { type: 'button', onClick: showArchived, 'aria-pressed': view === 'archived', style: { padding: '7px 11px', border: `1px solid ${colors.border}`, borderRadius: 6, background: view === 'archived' ? colors.surface : 'transparent', color: colors.text, cursor: 'pointer' } }, t('archiveView')),
     ),
     h('div', { style: { display: 'grid', gap: 8, marginBottom: 18 } },
+      h('label', { style: { color: colors.secondary, fontSize: 12 } }, t('modelTitle')),
+      h('select', {
+        value: selectedModelValue,
+        disabled: modelSaving || modelSettings === undefined || modelSettings.writable === false,
+        onChange: (event: Event) => { void saveModel((event.target as unknown as { value: string }).value) },
+        style: { boxSizing: 'border-box', minHeight: 38, width: '100%', padding: '0 10px', color: colors.text, background: colors.elevated, border: `1px solid ${modelSettings?.available === false ? colors.warning : colors.border}`, borderRadius: 8, colorScheme: 'light dark', font: 'inherit' },
+      },
+      unavailableSelection !== undefined && h('option', {
+        value: selectedModelValue,
+        style: { color: colors.text, background: colors.elevated },
+      }, `${unavailableSelection.provider} / ${unavailableSelection.model} (${t('modelUnavailable')})`),
+      ...(modelSettings?.catalog.groups ?? []).map(group => h('optgroup', { key: group.id, label: group.name },
+        group.models.map(model => h('option', { key: `${group.id}:${model.id}`, value: JSON.stringify([group.id, model.id]), style: { color: colors.text, background: colors.elevated } }, model.name)),
+      ))),
+      modelSaving && h('span', { style: { color: colors.secondary, fontSize: 12 } }, t('modelSaving')),
+      modelSettings?.available === false && h('span', { role: 'alert', style: { color: colors.warning, fontSize: 12 } }, t('modelUnavailable')),
+      modelError && h('span', { role: 'alert', style: { color: colors.danger, fontSize: 12 } }, t('modelFailed')),
+    ),
+    h('div', { style: { display: 'grid', gap: 8, marginBottom: 18 } },
       h('label', { style: { color: colors.secondary, fontSize: 12 } }, t('scope')),
       h('select', {
         value: displayedKey,
@@ -316,7 +570,7 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
         style: { boxSizing: 'border-box', minHeight: 38, width: '100%', padding: '0 10px', color: colors.text, background: colors.elevated, border: `1px solid ${colors.border}`, borderRadius: 8, colorScheme: 'light dark', font: 'inherit' },
       }, displayedOptions.length === 0
         ? h('option', { value: '', style: { color: colors.text, background: colors.elevated } }, view === 'active' ? t('emptyScopes') : t('archiveEmpty'))
-        : displayedOptions.map(scope => h('option', { key: scope.key, value: scope.key, style: { color: colors.text, background: colors.elevated } }, scope.kind === 'global' ? t('global') : workspaceName(scope.cwd, t('workspace')))),
+        : displayedOptions.map(scope => h('option', { key: scope.key, value: scope.key, style: { color: colors.text, background: colors.elevated } }, scope.kind === 'global' ? t('global') : workspaceLabel(scope, displayedOptions, t('workspace')))),
       ),
     ),
     error && h('div', { role: 'alert', style: { padding: 12, border: `1px solid ${colors.border}`, borderRadius: 6, color: colors.secondary, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 } },
@@ -329,7 +583,12 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
         h('span', null, `${displayedPayload?.entries.length ?? 0}${t('count')}`),
         h('span', null, `${t('pending')}: ${displayedPayload?.state.pending ?? 0}`),
         h('span', null, `${t('checkpoints')}: ${displayedPayload?.state.checkpointCount ?? 0}`),
+        h('span', null, `${t('processing')}: ${t(displayedPayload?.state.processing.phase ?? 'idle')}`),
+        displayedPayload?.state.processing.nextRunAt !== undefined && h('span', null, `${t('nextRun')}: ${formatDate(displayedPayload.state.processing.nextRunAt)}`),
+        displayedPayload?.state.processing.lastSuccessAt !== undefined && h('span', null, `${t('lastSuccess')}: ${formatDate(displayedPayload.state.processing.lastSuccessAt)}`),
       ),
+      displayedPayload?.state.processing.lastError !== undefined && h('div', { role: 'alert', style: { color: colors.warning, fontSize: 12, overflowWrap: 'anywhere' } }, `${t('lastError')}: ${displayedPayload.state.processing.lastError}`),
+      mutationError && h('div', { role: 'alert', style: { color: colors.danger, fontSize: 12 } }, t('mutationFailed')),
       view === 'archived' && displayedPayload !== undefined && h('button', { type: 'button', onClick: () => { void purge() }, style: { justifySelf: 'start', color: colors.danger, background: 'transparent', border: `1px solid ${colors.danger}`, borderRadius: 8, padding: '7px 11px', cursor: 'pointer' } }, t('purge')),
       h('article', { style: { border: `1px solid ${colors.border}`, borderRadius: 6, padding: 14, background: colors.surface } },
         h('h3', { style: { margin: '0 0 10px', fontSize: 14 } }, t('summary')),
@@ -341,14 +600,49 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
           h('input', { type: 'search', value: query, placeholder: t('searchPlaceholder'), 'aria-label': t('search'), onChange: (event: Event) => { setQuery((event.target as unknown as { value: string }).value) }, style: { minHeight: 32, width: 230, maxWidth: '48%', padding: '0 9px', color: colors.text, background: 'transparent', border: `1px solid ${colors.border}`, borderRadius: 6 } }),
         ),
         filteredEntries.length === 0 && h('p', { style: { color: colors.secondary, margin: 0 } }, t('noEntries')),
-        filteredEntries.map(entry => h('details', { key: entry.id, style: { border: `1px solid ${colors.border}`, borderRadius: 6, padding: '10px 12px', background: colors.surface } },
+        filteredEntries.map(entry => h('details', { key: entry.id, open: editDraft?.id === entry.id ? true : undefined, style: { border: `1px solid ${colors.border}`, borderRadius: 6, padding: '10px 12px', background: colors.surface } },
           h('summary', { style: { cursor: 'pointer', display: 'flex', gap: 8, alignItems: 'baseline' } },
             h('strong', { style: { fontSize: 13 } }, entry.title),
-            h('span', { style: { color: colors.tertiary, fontSize: 11 } }, entry.type),
+            h('span', { style: { color: colors.tertiary, fontSize: 11 } }, memoryTypeLabel(t, entry.type)),
             h('span', { style: { color: entry.status === 'conflict' ? colors.warning : entry.status === 'superseded' ? colors.tertiary : colors.accent, fontSize: 11 } }, t(entry.status)),
           ),
-          h('p', { style: { margin: '10px 0 0', color: colors.secondary, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } }, entry.content),
-          entry.tags.length > 0 && h('div', { style: { marginTop: 10, color: colors.accent, fontSize: 11 } }, entry.tags.join(' · ')),
+          editDraft?.id === entry.id
+            ? h('div', { style: { display: 'grid', gap: 10, marginTop: 12 } },
+                h('label', { style: { display: 'grid', gap: 5, color: colors.secondary, fontSize: 11 } }, t('titleLabel'),
+                  h('input', { value: editDraft.title, onChange: (event: Event) => setEditDraft({ ...editDraft, title: (event.target as unknown as { value: string }).value }), style: { boxSizing: 'border-box', width: '100%', minHeight: 34, padding: '0 9px', color: colors.text, background: colors.elevated, border: `1px solid ${colors.border}`, borderRadius: 6 } }),
+                ),
+                h('label', { style: { display: 'grid', gap: 5, color: colors.secondary, fontSize: 11 } }, t('descriptionLabel'),
+                  h('input', { value: editDraft.description, onChange: (event: Event) => setEditDraft({ ...editDraft, description: (event.target as unknown as { value: string }).value }), style: { boxSizing: 'border-box', width: '100%', minHeight: 34, padding: '0 9px', color: colors.text, background: colors.elevated, border: `1px solid ${colors.border}`, borderRadius: 6 } }),
+                ),
+                h('label', { style: { display: 'grid', gap: 5, color: colors.secondary, fontSize: 11 } }, t('contentLabel'),
+                  h('textarea', { value: editDraft.content, rows: 5, onChange: (event: Event) => setEditDraft({ ...editDraft, content: (event.target as unknown as { value: string }).value }), style: { boxSizing: 'border-box', width: '100%', resize: 'vertical', minHeight: 110, padding: 9, color: colors.text, background: colors.elevated, border: `1px solid ${colors.border}`, borderRadius: 6, font: 'inherit', lineHeight: 1.5 } }),
+                ),
+                h('label', { style: { display: 'grid', gap: 5, color: colors.secondary, fontSize: 11 } }, t('tagsLabel'),
+                  h('input', { value: editDraft.tags, onChange: (event: Event) => setEditDraft({ ...editDraft, tags: (event.target as unknown as { value: string }).value }), style: { boxSizing: 'border-box', width: '100%', minHeight: 34, padding: '0 9px', color: colors.text, background: colors.elevated, border: `1px solid ${colors.border}`, borderRadius: 6 } }),
+                ),
+                h('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 10 } },
+                  h('label', { style: { display: 'grid', gap: 5, color: colors.secondary, fontSize: 11 } }, t('typeLabel'),
+                    h('select', { value: editDraft.type, onChange: (event: Event) => setEditDraft({ ...editDraft, type: (event.target as unknown as { value: string }).value }), style: { boxSizing: 'border-box', width: '100%', minHeight: 34, padding: '0 9px', color: colors.text, background: colors.elevated, border: `1px solid ${colors.border}`, borderRadius: 6 } },
+                      memoryTypes.map(type => h('option', { key: type, value: type }, memoryTypeLabel(t, type))),
+                    ),
+                  ),
+                  h('label', { style: { display: 'grid', gap: 5, color: colors.secondary, fontSize: 11 } }, t('importanceLabel'),
+                    h('select', { value: String(editDraft.importance), onChange: (event: Event) => setEditDraft({ ...editDraft, importance: Number((event.target as unknown as { value: string }).value) }), style: { boxSizing: 'border-box', width: '100%', minHeight: 34, padding: '0 9px', color: colors.text, background: colors.elevated, border: `1px solid ${colors.border}`, borderRadius: 6 } },
+                      [0, 1, 2, 3].map(value => h('option', { key: value, value: String(value) }, String(value))),
+                    ),
+                  ),
+                ),
+                h('div', { style: { display: 'flex', gap: 8 } },
+                  h('button', { type: 'button', disabled: mutating, onClick: () => { void saveEntry() }, style: { padding: '7px 11px', color: '#fff', background: colors.accent, border: 0, borderRadius: 6, cursor: 'pointer' } }, t('save')),
+                  h('button', { type: 'button', disabled: mutating, onClick: () => setEditDraft(undefined), style: { padding: '7px 11px', color: colors.text, background: 'transparent', border: `1px solid ${colors.border}`, borderRadius: 6, cursor: 'pointer' } }, t('cancel')),
+                ),
+              )
+            : h('p', { style: { margin: '10px 0 0', color: colors.secondary, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } }, entry.content),
+          editDraft?.id !== entry.id && entry.tags.length > 0 && h('div', { style: { marginTop: 10, color: colors.accent, fontSize: 11 } }, entry.tags.join(' · ')),
+          view === 'active' && editDraft?.id !== entry.id && h('div', { style: { display: 'flex', gap: 8, marginTop: 10 } },
+            entry.status === 'active' && h('button', { type: 'button', disabled: mutating, onClick: () => beginEdit(entry), style: { padding: '6px 10px', color: colors.accent, background: 'transparent', border: `1px solid ${colors.border}`, borderRadius: 6, cursor: 'pointer' } }, t('edit')),
+            h('button', { type: 'button', disabled: mutating, onClick: () => { void deleteEntry(entry) }, style: { padding: '6px 10px', color: colors.danger, background: 'transparent', border: `1px solid ${colors.border}`, borderRadius: 6, cursor: 'pointer' } }, t('delete')),
+          ),
           (entry.revisions?.length ?? 0) > 0 && h('details', { style: { marginTop: 10, color: colors.secondary, fontSize: 11 } },
             h('summary', { style: { cursor: 'pointer' } }, `${t('revisions')} (${entry.revisions?.length ?? 0})`),
             entry.revisions?.map(revision => h('p', { key: `${revision.at}:${revision.content}`, style: { margin: '6px 0 0', whiteSpace: 'pre-wrap' } }, revision.content)),

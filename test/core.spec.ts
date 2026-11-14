@@ -259,6 +259,26 @@ test('idle policy is a fallback rather than an hourly schedule', () => {
   assert.equal(checkpointEligible(state, 'idle', config, 1001), true)
 })
 
+test('deferred checkpoints persist messages without calling the distiller', async () => {
+  const f = await fixture({ config: { checkpointTurns: 1 } })
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'deferred-workspace')
+  const buffered = await f.engine.checkpoint({
+    cwd,
+    reason: 'segment-end',
+    defer: true,
+    messages: [{ id: 'deferred-user', role: 'user', text: '完整轮次先进入后台队列。' }],
+  })
+  assert.equal(buffered.status, 'buffered')
+  assert.equal(f.calls.length, 0)
+  assert.equal((await f.store.readState(f.store.scope(cwd))).pendingMessages.length, 1)
+
+  const committed = await f.engine.checkpoint({ cwd, reason: 'idle', messages: [] })
+  assert.equal(committed.status, 'committed')
+  assert.equal(f.calls.length, 1)
+  assert.equal((await f.store.readState(f.store.scope(cwd))).pendingMessages.length, 0)
+})
+
 test('rejects credential-shaped explicit memories', async () => {
   const f = await fixture()
   onTestFinished(f.cleanup)
@@ -394,6 +414,59 @@ test('revises a near-duplicate with shorter content and retains the previous ver
   const entries = await f.store.readEntries(f.store.scope(cwd))
   assert.equal(entries[0]?.content, '项目使用 PostgreSQL。')
   assert.equal(entries[0]?.revisions?.[0]?.content, '项目使用 PostgreSQL 数据库。')
+})
+
+test('manually edits and deletes a memory while rebuilding recall and summary', async () => {
+  const f = await fixture()
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace-manual-edit')
+  await f.engine.remember({ cwd, content: '项目数据库使用 MySQL。', title: '数据库', tags: ['mysql'], importance: 2 })
+  const scope = f.store.scope(cwd)
+  const id = (await f.store.readEntries(scope))[0]?.id
+  assert.ok(id)
+
+  const updated = await f.engine.update({
+    cwd,
+    id,
+    content: '项目数据库使用 PostgreSQL。',
+    title: '数据库选型',
+    description: '当前项目数据库',
+    tags: ['postgresql'],
+    type: 'architecture',
+    importance: 3,
+  })
+  assert.equal(updated.updated, true)
+  const edited = (await f.store.readEntries(scope))[0]
+  assert.equal(edited?.content, '项目数据库使用 PostgreSQL。')
+  assert.equal(edited?.revisions?.[0]?.content, '项目数据库使用 MySQL。')
+  assert.equal(edited?.provenance?.reason, 'manual')
+  const recalled = await f.engine.recall({ cwd, query: 'PostgreSQL' })
+  assert.equal(recalled.matches[0]?.content, '项目数据库使用 PostgreSQL。')
+  assert.match(recalled.summary, /数据库选型/u)
+  assert.doesNotMatch(recalled.summary, /MySQL/u)
+
+  const deleted = await f.engine.forget({ cwd, id })
+  assert.equal(deleted.deleted, true)
+  assert.equal((await f.engine.recall({ cwd, query: 'PostgreSQL' })).matches.length, 0)
+  assert.doesNotMatch((await f.store.readSnapshot(scope)).summary, /数据库选型/u)
+})
+
+test('deleting one conflicting memory restores the remaining fact to active recall', async () => {
+  const f = await fixture()
+  onTestFinished(f.cleanup)
+  const cwd = join(f.root, 'workspace-conflict-delete')
+  const scope = f.store.scope(cwd)
+  await f.store.ensure(scope)
+  await f.store.writeEntries(scope, [
+    { id: 'wrong', content: '项目使用 MySQL。', title: '数据库', status: 'conflict', conflictGroupId: 'database-conflict' },
+    { id: 'correct', content: '项目使用 PostgreSQL。', title: '数据库', status: 'conflict', conflictGroupId: 'database-conflict' },
+  ])
+
+  assert.equal((await f.engine.forget({ cwd, id: 'wrong' })).deleted, true)
+  const entries = await f.store.readEntries(scope)
+  assert.equal(entries.find(entry => entry.id === 'correct')?.status, 'active')
+  assert.equal(entries.find(entry => entry.id === 'correct')?.conflictGroupId, undefined)
+  assert.equal((await f.engine.recall({ cwd, query: 'PostgreSQL' })).matches[0]?.id, 'correct')
 })
 
 test('supersedes an explicitly corrected memory and immediately removes it from recall and summary', async () => {

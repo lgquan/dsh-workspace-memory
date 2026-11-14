@@ -101,6 +101,8 @@ export interface CheckpointInput {
   messages: readonly MemoryMessage[]
   reason: CheckpointReason
   force?: boolean
+  /** Persist accepted messages without starting distillation in this call. */
+  defer?: boolean
 }
 
 export interface CheckpointResult extends MutationResult {
@@ -117,6 +119,12 @@ export interface RememberInput extends MemoryProposal {
 }
 
 export interface ForgetInput {
+  sessionId?: SessionId
+  cwd?: string
+  id: string
+}
+
+export interface UpdateInput extends MemoryProposal {
   sessionId?: SessionId
   cwd?: string
   id: string
@@ -1166,7 +1174,7 @@ export class WorkspaceMemoryEngine {
       if (accepted === 0 && state.pendingMessages.length === 0) {
         return { kind: 'result' as const, result: { status: 'empty' as const, scope: scope.key, accepted: 0, pending: 0, added: 0, updated: 0, ignored: 0 } }
       }
-      const eligible = input.force === true || checkpointEligible(state, input.reason, this.config, this.store.now())
+      const eligible = input.defer !== true && (input.force === true || checkpointEligible(state, input.reason, this.config, this.store.now()))
       if (!eligible) {
         await this.store.writeState(scope, state)
         return { kind: 'result' as const, result: { status: 'buffered' as const, scope: scope.key, accepted, pending: state.pendingMessages.length, added: 0, updated: 0, ignored: 0 } }
@@ -1302,6 +1310,46 @@ export class WorkspaceMemoryEngine {
     })
   }
 
+  async update(input: UpdateInput): Promise<{ scope: string; updated: boolean }> {
+    const scope = this.store.scope(input.cwd)
+    return this.store.withScope(scope, async () => {
+      await this.store.ensure(scope)
+      const entries = await this.store.readEntries(scope)
+      const entry = entries.find(candidate => candidate.id === input.id && isRecallable(candidate))
+      if (entry === undefined) return { scope: scope.key, updated: false }
+      const proposal = normalizeProposal(input)
+      if (proposal === undefined) throw new Error('memory content is empty or contains a credential-like secret')
+      const next = {
+        content: proposal.content,
+        type: proposal.type,
+        title: proposal.title,
+        description: proposal.description,
+        retrievalTerms: proposal.retrievalTerms,
+        tags: proposal.tags,
+        importance: proposal.importance,
+      }
+      const current = {
+        content: entry.content,
+        type: entry.type ?? 'fact',
+        title: entry.title ?? entry.content.slice(0, 80),
+        description: entry.description ?? entry.content.slice(0, 240),
+        retrievalTerms: entry.retrievalTerms ?? [],
+        tags: entry.tags ?? [],
+        importance: entry.importance ?? 1,
+      }
+      if (JSON.stringify(current) === JSON.stringify(next)) return { scope: scope.key, updated: true }
+      const nowIso = new Date(this.store.now()).toISOString()
+      appendRevision(entry, nowIso)
+      Object.assign(entry, next, {
+        provenance: { messageIds: [], reason: 'manual' as const },
+        updatedAt: nowIso,
+      })
+      await this.store.writeEntries(scope, entries)
+      await this.store.rebuildSummary(scope, entries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
+      return { scope: scope.key, updated: true }
+    })
+  }
+
   async forget(input: ForgetInput): Promise<{ scope: string; deleted: boolean }> {
     const scope = this.store.scope(input.cwd)
     return this.store.withScope(scope, async () => {
@@ -1309,8 +1357,18 @@ export class WorkspaceMemoryEngine {
       const entries = await this.store.readEntries(scope)
       const entry = entries.find(candidate => candidate.id === input.id && candidate.status !== 'deleted')
       if (entry === undefined) return { scope: scope.key, deleted: false }
+      const conflictGroupId = entry.conflictGroupId
       entry.status = 'deleted'
-      entry.updatedAt = new Date(this.store.now()).toISOString()
+      const nowIso = new Date(this.store.now()).toISOString()
+      entry.updatedAt = nowIso
+      if (conflictGroupId !== undefined) {
+        const remaining = entries.filter(candidate => candidate.status === 'conflict' && candidate.conflictGroupId === conflictGroupId)
+        if (remaining.length === 1 && remaining[0] !== undefined) {
+          remaining[0].status = 'active'
+          delete remaining[0].conflictGroupId
+          remaining[0].updatedAt = nowIso
+        }
+      }
       await this.store.writeEntries(scope, entries)
       await this.store.rebuildSummary(scope, entries, this.config.summaryMaxBytes, this.config.keepSummaryVersions)
       return { scope: scope.key, deleted: true }

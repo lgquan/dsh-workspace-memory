@@ -7,4 +7,8 @@
         checkpointTurns: 10
         checkpointChars: 4000
         idleCheckpointMs: 300000
+        processingDelayMs: 15000
+        maxConcurrentDistillations: 1
+        summarizeProvider: deepseek-account
+        summarizeModel: deepseek-flash
         consolidateEvery: 5
