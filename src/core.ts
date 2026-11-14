@@ -877,14 +877,22 @@ export class WorkspaceMemoryStore {
 
   /** Move one workspace scope to the recoverable archive. */
   async archiveScope(scope: WorkspaceScope): Promise<boolean> {
-    if (scope.key === 'global' || !existsSync(scope.dir)) return false
+    if (scope.key === 'global') return false
+    const destination = archivedScopeDirectory(this.root, scope.key)
+    this.invalidateSnapshotAt(scope.key, scope.dir)
+    this.invalidateSnapshotAt(scope.key, destination)
+    if (!existsSync(scope.dir)) return false
     return this.withScope(scope, async () => {
-      if (!existsSync(scope.dir)) return false
-      const destination = archivedScopeDirectory(this.root, scope.key)
-      await mkdir(join(this.root, ARCHIVE_DIR), { recursive: true })
-      if (existsSync(destination)) return false
-      await rename(scope.dir, destination)
-      return true
+      try {
+        if (!existsSync(scope.dir)) return false
+        await mkdir(join(this.root, ARCHIVE_DIR), { recursive: true })
+        if (existsSync(destination)) return false
+        await rename(scope.dir, destination)
+        return true
+      } finally {
+        this.invalidateSnapshotAt(scope.key, scope.dir)
+        this.invalidateSnapshotAt(scope.key, destination)
+      }
     })
   }
 
@@ -892,9 +900,16 @@ export class WorkspaceMemoryStore {
   async purgeArchivedScope(scope: WorkspaceScope): Promise<boolean> {
     if (scope.key === 'global') return false
     const directory = archivedScopeDirectory(this.root, scope.key)
-    if (!existsSync(directory)) return false
-    await rm(directory, { recursive: true, force: true })
-    return true
+    this.invalidateSnapshotAt(scope.key, scope.dir)
+    this.invalidateSnapshotAt(scope.key, directory)
+    try {
+      if (!existsSync(directory)) return false
+      await rm(directory, { recursive: true, force: true })
+      return true
+    } finally {
+      this.invalidateSnapshotAt(scope.key, scope.dir)
+      this.invalidateSnapshotAt(scope.key, directory)
+    }
   }
 
   /** Read one scope without forcing initialization or writing any files. */
@@ -995,7 +1010,11 @@ export class WorkspaceMemoryStore {
   }
 
   private invalidateSnapshot(scope: WorkspaceScope): void {
-    const cacheKey = `${scope.key}:${scope.dir}`
+    this.invalidateSnapshotAt(scope.key, scope.dir)
+  }
+
+  private invalidateSnapshotAt(scopeKey: string, directory: string): void {
+    const cacheKey = `${scopeKey}:${directory}`
     this.snapshotCache.delete(cacheKey)
     this.snapshotGenerations.set(cacheKey, (this.snapshotGenerations.get(cacheKey) ?? 0) + 1)
   }

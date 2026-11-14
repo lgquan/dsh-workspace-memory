@@ -24,7 +24,7 @@
 在 PowerShell 或终端中运行：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.3.0
+dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.3.1
 ```
 
 NPM 包地址：[@flowingspring/dsh-workspace-memory](https://www.npmjs.com/package/@flowingspring/dsh-workspace-memory)
@@ -34,10 +34,10 @@ NPM 包地址：[@flowingspring/dsh-workspace-memory](https://www.npmjs.com/pack
 直接安装 GitHub Release 中的预构建插件包：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.3.0/flowingspring-dsh-workspace-memory-0.3.0.tgz
+dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.3.1/flowingspring-dsh-workspace-memory-0.3.1.tgz
 ```
 
-Release 页面：[v0.3.0](https://github.com/lgquan/dsh-workspace-memory/releases/tag/v0.3.0)
+Release 页面：[v0.3.1](https://github.com/lgquan/dsh-workspace-memory/releases/tag/v0.3.1)
 
 ## 安装后怎么使用
 
@@ -69,13 +69,13 @@ dsh plugin --profile web list
 使用 NPM 更新到指定版本：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.3.0
+dsh plugin --profile web add --config.minimumReleaseAge=0 @flowingspring/dsh-workspace-memory@0.3.1
 ```
 
 使用 GitHub 更新到指定标签：
 
 ```powershell
-dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.3.0/flowingspring-dsh-workspace-memory-0.3.0.tgz
+dsh plugin --profile web add --config.minimumReleaseAge=0 https://github.com/lgquan/dsh-workspace-memory/releases/download/v0.3.1/flowingspring-dsh-workspace-memory-0.3.1.tgz
 ```
 
 更新后重启 `dsh web`。

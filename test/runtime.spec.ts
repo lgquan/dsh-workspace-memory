@@ -1024,3 +1024,57 @@ test('browser API exposes Host workspace titles and the routable model catalog',
   assert.equal(deletedSnapshot.entries[0]?.status, 'deleted')
   assert.doesNotMatch(deletedSnapshot.summary, /数据库选型/u)
 })
+
+test('browser API permanently deletes cached memory before the same workspace path is reused', async () => {
+  const memoryDir = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-delete-cache-'))
+  const workspace = join(memoryDir, 'recreated-project')
+  const store = new WorkspaceMemoryStore(memoryDir)
+  const scope = store.scope(workspace)
+  await store.ensure(scope)
+  await store.writeEntries(scope, [{
+    id: 'deleted-project-memory',
+    content: '这个工作区只用于测试玩法。',
+    status: 'active',
+  }])
+
+  const ctx = new Context()
+  onTestFinished(async () => {
+    await ctx.fiber.dispose()
+    await rm(memoryDir, { recursive: true, force: true })
+  })
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(FakeWebServer)
+  await ctx.plugin(FakeWorkspaceRegistry, [])
+  await ctx.plugin(WorkspaceMemoryRuntime, { memoryDir })
+  await flushAsyncWork()
+
+  const webServer = ctx.get('webServer') as unknown as FakeWebServer
+  const scopesHandler = webServer.routes.get('/workspace-memory/api/v1/scopes')
+  const archivedScopesHandler = webServer.routes.get('/workspace-memory/api/v1/archived-scopes')
+  const scopeHandler = webServer.routes.get('/workspace-memory/api/v1/scope')
+  const archivedScopeHandler = webServer.routes.get('/workspace-memory/api/v1/archived-scope')
+  assert.ok(scopesHandler)
+  assert.ok(archivedScopesHandler)
+  assert.ok(scopeHandler)
+  assert.ok(archivedScopeHandler)
+
+  const scopeUrl = `/workspace-memory/api/v1/scope?cwd=${encodeURIComponent(workspace)}`
+  const before = await requestJson(scopeHandler, scopeUrl)
+  assert.equal((before.body as { entries: unknown[] }).entries.length, 1)
+
+  await requestJson(scopesHandler, '/workspace-memory/api/v1/scopes')
+  const archived = await requestJson(archivedScopesHandler, '/workspace-memory/api/v1/archived-scopes')
+  assert.equal((archived.body as { scopes: unknown[] }).scopes.length, 1)
+
+  const archiveUrl = `/workspace-memory/api/v1/archived-scope?key=${encodeURIComponent(scope.key)}`
+  const archivedSnapshot = await requestJson(archivedScopeHandler, archiveUrl)
+  assert.equal((archivedSnapshot.body as { entries: unknown[] }).entries.length, 1)
+  const purged = await requestJson(archivedScopeHandler, archiveUrl, 'DELETE')
+  assert.deepEqual(purged, { status: 200, body: { deleted: true } })
+
+  const recreated = await requestJson(scopeHandler, scopeUrl)
+  assert.equal((recreated.body as { entries: unknown[] }).entries.length, 0)
+  const memory = ctx.get('workspaceMemory')
+  assert.ok(memory)
+  assert.equal((await memory.recall({ cwd: workspace, query: '测试玩法' })).matches.length, 0)
+})
