@@ -47,9 +47,16 @@ const zh = {
   queued: '排队中',
   running: '整理中',
   retrying: '等待重试',
+  blocked: '已暂停',
   nextRun: '下次运行',
   lastSuccess: '上次成功',
   lastError: '最近错误',
+  distillCalls: '整理调用',
+  failedCalls: '失败调用',
+  tokenUsage: '整理 Token',
+  inputTokens: '输入',
+  outputTokens: '输出',
+  retryNow: '立即重试',
   edit: '编辑',
   delete: '删除',
   save: '保存',
@@ -112,9 +119,16 @@ const en = {
   queued: 'Queued',
   running: 'Distilling',
   retrying: 'Waiting to retry',
+  blocked: 'Paused',
   nextRun: 'Next run',
   lastSuccess: 'Last success',
   lastError: 'Last error',
+  distillCalls: 'Distillation calls',
+  failedCalls: 'Failed calls',
+  tokenUsage: 'Distillation tokens',
+  inputTokens: 'Input',
+  outputTokens: 'Output',
+  retryNow: 'Retry now',
   edit: 'Edit',
   delete: 'Delete',
   save: 'Save',
@@ -152,11 +166,28 @@ interface ScopeInfo {
 }
 
 interface ProcessingInfo {
-  phase: 'idle' | 'scheduled' | 'queued' | 'running' | 'retrying'
+  phase: 'idle' | 'scheduled' | 'queued' | 'running' | 'retrying' | 'blocked'
   nextRunAt?: string
   runningSince?: string
   lastSuccessAt?: string
   lastError?: string
+}
+
+interface DistillationStats {
+  calls: number
+  failures: number
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  reasoningTokens: number
+  consecutiveFailures: number
+  blocked: boolean
+  lastCallAt?: number
+  lastFinishReason?: string
+  lastError?: string
+  lastErrorCode?: string
 }
 
 interface MemoryEntry {
@@ -181,7 +212,7 @@ interface ScopePayload {
   scope: { key: string; cwd: string; kind: 'global' | 'workspace' }
   summary: string
   entries: MemoryEntry[]
-  state: { pending: number; checkpointCount: number; lastCheckpointAt: number; processing: ProcessingInfo }
+  state: { pending: number; checkpointCount: number; lastCheckpointAt: number; processing: ProcessingInfo; distillation: DistillationStats }
 }
 
 interface ModelSettings {
@@ -516,6 +547,22 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
     }
   }
 
+  const retryDistillation = async (): Promise<void> => {
+    if (displayedPayload === undefined || view !== 'active') return
+    setMutating(true)
+    setMutationError(false)
+    try {
+      const query = new URLSearchParams({ cwd: displayedPayload.scope.cwd })
+      const response = await fetch(`/workspace-memory/api/v1/retry?${query.toString()}`, { method: 'POST' })
+      if (!response.ok) throw new Error(`memory retry failed (${response.status})`)
+      await reload(displayedPayload.scope.cwd)
+    } catch {
+      setMutationError(true)
+    } finally {
+      setMutating(false)
+    }
+  }
+
   const colors = {
     text: 'var(--dsw-alias-label-primary, #1f2328)',
     secondary: 'var(--dsw-alias-label-secondary, #6b7280)',
@@ -586,10 +633,17 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
         h('span', null, `${t('pending')}: ${displayedPayload?.state.pending ?? 0}`),
         h('span', null, `${t('checkpoints')}: ${displayedPayload?.state.checkpointCount ?? 0}`),
         h('span', null, `${t('processing')}: ${t(displayedPayload?.state.processing.phase ?? 'idle')}`),
+        h('span', null, `${t('distillCalls')}: ${(displayedPayload?.state.distillation.calls ?? 0).toLocaleString()}`),
+        h('span', null, `${t('failedCalls')}: ${(displayedPayload?.state.distillation.failures ?? 0).toLocaleString()}`),
+        h('span', null, `${t('tokenUsage')}: ${(displayedPayload?.state.distillation.totalTokens ?? 0).toLocaleString()} (${t('inputTokens')} ${(displayedPayload?.state.distillation.inputTokens ?? 0).toLocaleString()} / ${t('outputTokens')} ${(displayedPayload?.state.distillation.outputTokens ?? 0).toLocaleString()})`),
         displayedPayload?.state.processing.nextRunAt !== undefined && h('span', null, `${t('nextRun')}: ${formatDate(displayedPayload.state.processing.nextRunAt)}`),
         displayedPayload?.state.processing.lastSuccessAt !== undefined && h('span', null, `${t('lastSuccess')}: ${formatDate(displayedPayload.state.processing.lastSuccessAt)}`),
       ),
       displayedPayload?.state.processing.lastError !== undefined && h('div', { role: 'alert', style: { color: colors.warning, fontSize: 12, overflowWrap: 'anywhere' } }, `${t('lastError')}: ${displayedPayload.state.processing.lastError}`),
+      view === 'active' && displayedPayload?.state.processing.phase === 'blocked' && h('button', {
+        type: 'button', disabled: mutating, onClick: () => { void retryDistillation() },
+        style: { justifySelf: 'start', color: colors.text, background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 6, padding: '7px 11px', cursor: 'pointer' },
+      }, t('retryNow')),
       mutationError && h('div', { role: 'alert', style: { color: colors.danger, fontSize: 12 } }, t('mutationFailed')),
       view === 'archived' && displayedPayload !== undefined && h('button', { type: 'button', onClick: () => { void purge() }, style: { justifySelf: 'start', color: colors.danger, background: 'transparent', border: `1px solid ${colors.danger}`, borderRadius: 8, padding: '7px 11px', cursor: 'pointer' } }, t('purge')),
       h('article', { style: { border: `1px solid ${colors.border}`, borderRadius: 6, padding: 14, background: colors.surface } },

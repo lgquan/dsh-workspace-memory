@@ -33,15 +33,37 @@ class MemoryAdapter extends LlmAdapter {
 }
 
 class SequenceMemoryAdapter extends LlmAdapter {
+  readonly requests: GenerateOptions[] = []
   private index = 0
 
   constructor(private readonly outputs: readonly string[]) {
     super()
   }
 
-  async *stream(_options: GenerateOptions): AsyncGenerator<StreamChunk> {
+  async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
+    this.requests.push(options)
     const output = this.outputs[Math.min(this.index++, this.outputs.length - 1)] ?? '{}'
     yield { type: 'text-delta', index: 0, text: output }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+}
+
+class MaxTokenMemoryAdapter extends LlmAdapter {
+  readonly requests: GenerateOptions[] = []
+
+  async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
+    this.requests.push(options)
+    if (this.requests.length === 1) {
+      yield { type: 'text-delta', index: 0, text: '{"version":1,"operations":[{"op":"add","content":"截断' }
+      yield { type: 'usage', usage: { inputTokens: 100, outputTokens: 1500, totalTokens: 1600 } }
+      yield { type: 'finish', reason: { kind: 'max-tokens' } }
+      return
+    }
+    const requestText = options.messages.flatMap(message => message.content)
+      .flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
+    const content = requestText.includes('项目使用 PostgreSQL') ? '项目使用 PostgreSQL。' : '部署目标为 Linux。'
+    yield { type: 'text-delta', index: 0, text: JSON.stringify({ version: 1, operations: [{ op: 'add', type: 'fact', content }] }) }
+    yield { type: 'usage', usage: { inputTokens: 40, outputTokens: 20, totalTokens: 60 } }
     yield { type: 'finish', reason: { kind: 'stop' } }
   }
 }
@@ -285,7 +307,7 @@ test('recovers an overdue pending scope when the runtime starts', async () => {
   assert.match(recovered.summary, /workspaceMemory/u)
 })
 
-test('retries a failed checkpoint automatically', async () => {
+test('retries one invalid JSON response inside the same checkpoint', async () => {
   const memoryDir = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-retry-'))
   const workspace = join(memoryDir, 'project')
   onTestFinished(async () => {
@@ -294,10 +316,11 @@ test('retries a failed checkpoint automatically', async () => {
   const ctx = new Context()
   await ctx.plugin(SessionStore)
   await ctx.plugin(LlmRuntime)
-  ctx.llm.registerAdapter(['test'], new SequenceMemoryAdapter([
+  const adapter = new SequenceMemoryAdapter([
     'not valid json',
     '{"version":1,"operations":[{"op":"add","content":"重试成功后写入的事实。"}]}',
-  ]))
+  ])
+  ctx.llm.registerAdapter(['test'], adapter)
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
   await ctx.plugin(WorkspaceMemoryRuntime, {
@@ -311,16 +334,109 @@ test('retries a failed checkpoint automatically', async () => {
   const session = ctx.sessions.create(SessionId('retry-runtime-test'), { meta: { cwd: workspace } })
   const memory = ctx.get('workspaceMemory')
   assert.ok(memory)
-  const first = await memory.checkpoint({
+  const result = await memory.checkpoint({
     sessionId: session.id,
     reason: 'segment-end',
     messages: [{ id: 'retry-user', role: 'user', text: '第一次蒸馏会失败。' }],
   })
-  assert.equal(first.status, 'failed', JSON.stringify(first))
-  await new Promise(resolve => setTimeout(resolve, 1200))
-  await flushAsyncWork()
+  assert.equal(result.status, 'committed', JSON.stringify(result))
+  assert.equal(adapter.requests.length, 2)
+  assert.equal(adapter.requests[0]?.maxTokens, undefined)
   const state = await new WorkspaceMemoryStore(memoryDir).readState(new WorkspaceMemoryStore(memoryDir).scope(workspace))
   assert.equal(state.pendingMessages.length, 0)
+})
+
+test('splits a max-token distillation once and records actual token usage', async () => {
+  const memoryDir = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-max-tokens-'))
+  const workspace = join(memoryDir, 'project')
+  const ctx = new Context()
+  const adapter = new MaxTokenMemoryAdapter()
+  onTestFinished(async () => {
+    await ctx.fiber.dispose()
+    await rm(memoryDir, { recursive: true, force: true })
+  })
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(LlmRuntime)
+  ctx.llm.registerAdapter(['test'], adapter)
+  await ctx.plugin(WorkspaceMemoryRuntime, {
+    memoryDir,
+    checkpointTurns: 1,
+    summarizeProvider: 'test',
+    summarizeModel: 'test',
+  })
+  await flushAsyncWork()
+
+  const memory = ctx.get('workspaceMemory')
+  assert.ok(memory)
+  const result = await memory.checkpoint({
+    cwd: workspace,
+    reason: 'explicit',
+    messages: [
+      { id: 'max-token-a', role: 'user', text: '项目使用 PostgreSQL。' },
+      { id: 'max-token-b', role: 'user', text: '部署目标为 Linux。' },
+    ],
+  })
+  assert.equal(result.status, 'committed', JSON.stringify(result))
+  assert.equal(adapter.requests.length, 3)
+  assert.ok(adapter.requests.every(request => request.maxTokens === undefined))
+  const state = await new WorkspaceMemoryStore(memoryDir).readState(new WorkspaceMemoryStore(memoryDir).scope(workspace))
+  assert.equal(state.pendingMessages.length, 0)
+  assert.deepEqual(state.distillation, {
+    calls: 3,
+    failures: 1,
+    inputTokens: 180,
+    outputTokens: 1540,
+    totalTokens: 1720,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    reasoningTokens: 0,
+    consecutiveFailures: 0,
+    blocked: false,
+    lastFinishReason: 'stop',
+    lastCallAt: state.distillation.lastCallAt,
+  })
+})
+
+test('blocks permanently invalid JSON after one recovery call', async () => {
+  const memoryDir = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-invalid-output-'))
+  const workspace = join(memoryDir, 'project')
+  const ctx = new Context()
+  const adapter = new SequenceMemoryAdapter(['not valid json'])
+  onTestFinished(async () => {
+    await ctx.fiber.dispose()
+    await rm(memoryDir, { recursive: true, force: true })
+  })
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(LlmRuntime)
+  ctx.llm.registerAdapter(['test'], adapter)
+  await ctx.plugin(WorkspaceMemoryRuntime, {
+    memoryDir,
+    checkpointTurns: 1,
+    idleCheckpointMs: 1000,
+    summarizeProvider: 'test',
+    summarizeModel: 'test',
+  })
+  await flushAsyncWork()
+
+  const memory = ctx.get('workspaceMemory')
+  assert.ok(memory)
+  const result = await memory.checkpoint({
+    cwd: workspace,
+    reason: 'explicit',
+    messages: [{ id: 'invalid-output-user', role: 'user', text: '永久无效输出不能无限重试。' }],
+  })
+  assert.equal(result.status, 'failed')
+  assert.equal(result.errorCode, 'invalid-output')
+  assert.equal(result.blocked, true)
+  const blocked = await memory.checkpoint({ cwd: workspace, reason: 'idle', messages: [] })
+  assert.equal(blocked.status, 'buffered')
+  assert.equal(blocked.blocked, true)
+  await new Promise(resolve => setTimeout(resolve, 1200))
+  assert.equal(adapter.requests.length, 2)
+  const state = await new WorkspaceMemoryStore(memoryDir).readState(new WorkspaceMemoryStore(memoryDir).scope(workspace))
+  assert.equal(state.pendingMessages.length, 1)
+  assert.equal(state.distillation.blocked, true)
+  assert.equal(state.distillation.consecutiveFailures, 1)
 })
 
 test('queues derived DSH 0.2.2 messages without re-distilling recalled memory', async () => {
@@ -667,16 +783,30 @@ test('browser API exposes Host workspace titles and the routable model catalog',
 
   const webServer = ctx.get('webServer') as unknown as FakeWebServer
   const scopesHandler = webServer.routes.get('/workspace-memory/api/v1/scopes')
+  const scopeHandler = webServer.routes.get('/workspace-memory/api/v1/scope')
   const settingsHandler = webServer.routes.get('/workspace-memory/api/v1/settings')
+  const retryHandler = webServer.routes.get('/workspace-memory/api/v1/retry')
   const entryHandler = webServer.routes.get('/workspace-memory/api/v1/entry')
   assert.ok(scopesHandler)
+  assert.ok(scopeHandler)
   assert.ok(settingsHandler)
+  assert.ok(retryHandler)
   assert.ok(entryHandler)
 
   const scopesResponse = await requestJson(scopesHandler, '/workspace-memory/api/v1/scopes')
   assert.equal(scopesResponse.status, 200)
   const scopes = scopesResponse.body as { scopes: Array<{ cwd: string; title?: string }> }
   assert.ok(scopes.scopes.some(scope => scope.title === 'Renamed Project'))
+
+  const scopeResponse = await requestJson(scopeHandler, `/workspace-memory/api/v1/scope?cwd=${encodeURIComponent(workspace)}`)
+  assert.equal(scopeResponse.status, 200)
+  const scopePayload = scopeResponse.body as { state: { distillation: { calls: number; totalTokens: number; blocked: boolean } } }
+  assert.equal(scopePayload.state.distillation.calls, 0)
+  assert.equal(scopePayload.state.distillation.totalTokens, 0)
+  assert.equal(scopePayload.state.distillation.blocked, false)
+
+  const retryResponse = await requestJson(retryHandler, `/workspace-memory/api/v1/retry?cwd=${encodeURIComponent(workspace)}`, 'POST')
+  assert.equal(retryResponse.status, 200)
 
   const settingsResponse = await requestJson(settingsHandler, '/workspace-memory/api/v1/settings')
   assert.equal(settingsResponse.status, 200)

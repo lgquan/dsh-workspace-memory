@@ -111,6 +111,23 @@ export interface CheckpointResult extends MutationResult {
   accepted: number
   pending: number
   error?: string
+  errorCode?: DistillationErrorCode
+  retryable?: boolean
+  blocked?: boolean
+  consecutiveFailures?: number
+}
+
+export type DistillationErrorCode = 'max-tokens' | 'invalid-output' | 'provider-error' | 'aborted'
+
+export class MemoryDistillationError extends Error {
+  constructor(
+    message: string,
+    readonly code: DistillationErrorCode,
+    readonly retryable: boolean,
+  ) {
+    super(message)
+    this.name = 'MemoryDistillationError'
+  }
 }
 
 export interface RememberInput extends MemoryProposal {
@@ -169,6 +186,35 @@ export interface MemoryState {
   lastBufferedAt: number
   pendingMessages: MemoryMessage[]
   seenMessageIds: string[]
+  distillation: DistillationStats
+}
+
+export interface DistillationStats {
+  calls: number
+  failures: number
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  reasoningTokens: number
+  consecutiveFailures: number
+  blocked: boolean
+  lastCallAt?: number
+  lastFinishReason?: string
+  lastError?: string
+  lastErrorCode?: DistillationErrorCode
+}
+
+export interface DistillationCallRecord {
+  failed: boolean
+  finishReason: string
+  inputTokens?: number
+  outputTokens?: number
+  totalTokens?: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  reasoningTokens?: number
 }
 
 export interface MutationResult {
@@ -231,7 +277,46 @@ const DEFAULT_STATE: Readonly<MemoryState> = Object.freeze({
   lastBufferedAt: 0,
   pendingMessages: [],
   seenMessageIds: [],
+  distillation: Object.freeze({
+    calls: 0,
+    failures: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    reasoningTokens: 0,
+    consecutiveFailures: 0,
+    blocked: false,
+  }),
 })
+
+const MAX_CONSECUTIVE_DISTILLATION_FAILURES = 5
+
+function distillationStats(value: unknown): DistillationStats {
+  const stats = isRecord(value) ? value : {}
+  const number = (key: keyof DistillationStats): number => typeof stats[key] === 'number' ? stats[key] : 0
+  const errorCode = typeof stats.lastErrorCode === 'string'
+    && ['max-tokens', 'invalid-output', 'provider-error', 'aborted'].includes(stats.lastErrorCode)
+    ? stats.lastErrorCode as DistillationErrorCode
+    : undefined
+  return {
+    calls: number('calls'),
+    failures: number('failures'),
+    inputTokens: number('inputTokens'),
+    outputTokens: number('outputTokens'),
+    totalTokens: number('totalTokens'),
+    cacheReadTokens: number('cacheReadTokens'),
+    cacheWriteTokens: number('cacheWriteTokens'),
+    reasoningTokens: number('reasoningTokens'),
+    consecutiveFailures: number('consecutiveFailures'),
+    blocked: stats.blocked === true,
+    ...(typeof stats.lastCallAt === 'number' ? { lastCallAt: stats.lastCallAt } : {}),
+    ...(typeof stats.lastFinishReason === 'string' ? { lastFinishReason: stats.lastFinishReason } : {}),
+    ...(typeof stats.lastError === 'string' ? { lastError: stats.lastError } : {}),
+    ...(errorCode === undefined ? {} : { lastErrorCode: errorCode }),
+  }
+}
 
 function debugMemory(event: string, fields: Record<string, unknown>): void {
   if (process.env.DSH_WORKSPACE_MEMORY_DEBUG !== '1') return
@@ -581,10 +666,48 @@ export class WorkspaceMemoryStore {
         lastBufferedAt: typeof value.lastBufferedAt === 'number' ? value.lastBufferedAt : DEFAULT_STATE.lastBufferedAt,
         pendingMessages: safeArray(value.pendingMessages).filter(validMessage),
         seenMessageIds: safeArray(value.seenMessageIds).filter((item): item is string => typeof item === 'string'),
+        distillation: distillationStats(value.distillation),
       }
     } catch {
-      return { ...DEFAULT_STATE, pendingMessages: [], seenMessageIds: [] }
+      return { ...DEFAULT_STATE, pendingMessages: [], seenMessageIds: [], distillation: distillationStats(undefined) }
     }
+  }
+
+  async recordDistillationCall(scope: WorkspaceScope, call: DistillationCallRecord): Promise<void> {
+    await this.withScope(scope, async () => {
+      await this.ensure(scope)
+      const state = await this.readState(scope)
+      const current = state.distillation
+      const derivedTotal = (call.inputTokens ?? 0) + (call.outputTokens ?? 0)
+        + (call.cacheReadTokens ?? 0) + (call.cacheWriteTokens ?? 0)
+      state.distillation = {
+        ...current,
+        calls: current.calls + 1,
+        failures: current.failures + (call.failed ? 1 : 0),
+        inputTokens: current.inputTokens + (call.inputTokens ?? 0),
+        outputTokens: current.outputTokens + (call.outputTokens ?? 0),
+        totalTokens: current.totalTokens + (call.totalTokens ?? derivedTotal),
+        cacheReadTokens: current.cacheReadTokens + (call.cacheReadTokens ?? 0),
+        cacheWriteTokens: current.cacheWriteTokens + (call.cacheWriteTokens ?? 0),
+        reasoningTokens: current.reasoningTokens + (call.reasoningTokens ?? 0),
+        lastCallAt: this.now(),
+        lastFinishReason: call.finishReason,
+      }
+      await this.writeState(scope, state)
+    })
+  }
+
+  async resumeDistillation(scope: WorkspaceScope): Promise<MemoryState> {
+    return this.withScope(scope, async () => {
+      await this.ensure(scope)
+      const state = await this.readState(scope)
+      state.distillation.consecutiveFailures = 0
+      state.distillation.blocked = false
+      delete state.distillation.lastError
+      delete state.distillation.lastErrorCode
+      await this.writeState(scope, state)
+      return state
+    })
   }
 
   async readSummary(scope: WorkspaceScope): Promise<string> {
@@ -1174,16 +1297,54 @@ export class WorkspaceMemoryEngine {
       if (accepted === 0 && state.pendingMessages.length === 0) {
         return { kind: 'result' as const, result: { status: 'empty' as const, scope: scope.key, accepted: 0, pending: 0, added: 0, updated: 0, ignored: 0 } }
       }
+      if (state.distillation.blocked) {
+        if (accepted > 0) await this.store.writeState(scope, state)
+        return { kind: 'result' as const, result: {
+          status: 'buffered' as const,
+          scope: scope.key,
+          accepted,
+          pending: state.pendingMessages.length,
+          added: 0,
+          updated: 0,
+          ignored: 0,
+          blocked: true,
+          consecutiveFailures: state.distillation.consecutiveFailures,
+          ...(state.distillation.lastError === undefined ? {} : { error: state.distillation.lastError }),
+          ...(state.distillation.lastErrorCode === undefined ? {} : { errorCode: state.distillation.lastErrorCode }),
+        } }
+      }
       const eligible = input.defer !== true && (input.force === true || checkpointEligible(state, input.reason, this.config, this.store.now()))
       if (!eligible) {
         await this.store.writeState(scope, state)
-        return { kind: 'result' as const, result: { status: 'buffered' as const, scope: scope.key, accepted, pending: state.pendingMessages.length, added: 0, updated: 0, ignored: 0 } }
+        return { kind: 'result' as const, result: {
+          status: 'buffered' as const,
+          scope: scope.key,
+          accepted,
+          pending: state.pendingMessages.length,
+          added: 0,
+          updated: 0,
+          ignored: 0,
+          blocked: state.distillation.blocked,
+          consecutiveFailures: state.distillation.consecutiveFailures,
+          ...(state.distillation.lastError === undefined ? {} : { error: state.distillation.lastError }),
+          ...(state.distillation.lastErrorCode === undefined ? {} : { errorCode: state.distillation.lastErrorCode }),
+        } }
       }
       const claimed = this.inFlightMessages.get(scope.key) ?? new Set<string>()
       const available = state.pendingMessages.filter(message => !claimed.has(message.id))
       if (available.length === 0) {
         if (accepted > 0) await this.store.writeState(scope, state)
-        return { kind: 'result' as const, result: { status: 'buffered' as const, scope: scope.key, accepted, pending: state.pendingMessages.length, added: 0, updated: 0, ignored: 0 } }
+        return { kind: 'result' as const, result: {
+          status: 'buffered' as const,
+          scope: scope.key,
+          accepted,
+          pending: state.pendingMessages.length,
+          added: 0,
+          updated: 0,
+          ignored: 0,
+          blocked: state.distillation.blocked,
+          consecutiveFailures: state.distillation.consecutiveFailures,
+        } }
       }
       const staged: MemoryMessage[] = []
       let chars = 0
@@ -1216,7 +1377,22 @@ export class WorkspaceMemoryEngine {
     } catch (error) {
       debugMemory('distill-error', { scope: scope.key, durationMs: Math.max(0, this.store.now() - distillStartedAt), error: String(error) })
       this.releaseClaims(scope, prepared.staged)
-      const state = await this.store.withScope(scope, () => this.store.readState(scope))
+      const failure = error instanceof MemoryDistillationError
+        ? error
+        : new MemoryDistillationError(error instanceof Error ? error.message : String(error), 'provider-error', true)
+      const state = await this.store.withScope(scope, async () => {
+        const current = await this.store.readState(scope)
+        const consecutiveFailures = current.distillation.consecutiveFailures + 1
+        current.distillation = {
+          ...current.distillation,
+          consecutiveFailures,
+          blocked: !failure.retryable || consecutiveFailures >= MAX_CONSECUTIVE_DISTILLATION_FAILURES,
+          lastError: failure.message,
+          lastErrorCode: failure.code,
+        }
+        await this.store.writeState(scope, current)
+        return current
+      })
       return {
         status: 'failed',
         scope: scope.key,
@@ -1225,7 +1401,11 @@ export class WorkspaceMemoryEngine {
         added: 0,
         updated: 0,
         ignored: 0,
-        error: error instanceof Error ? error.message : String(error),
+        error: failure.message,
+        errorCode: failure.code,
+        retryable: failure.retryable,
+        blocked: state.distillation.blocked,
+        consecutiveFailures: state.distillation.consecutiveFailures,
       }
     }
 
@@ -1247,6 +1427,10 @@ export class WorkspaceMemoryEngine {
         state.pendingMessages = state.pendingMessages.filter(message => !stagedIds.has(message.id))
         state.lastCheckpointAt = this.store.now()
         state.checkpointCount += 1
+        state.distillation.consecutiveFailures = 0
+        state.distillation.blocked = false
+        delete state.distillation.lastError
+        delete state.distillation.lastErrorCode
         await this.store.writeEntries(scope, entries)
         let globalResult: AppliedOperations = { added: 0, updated: 0, ignored: 0, superseded: 0, conflicts: 0, audit: [] }
         if (globalOperations.length > 0 && scope.key !== 'global') {
