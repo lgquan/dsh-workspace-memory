@@ -138,6 +138,7 @@ export interface RememberInput extends MemoryProposal {
 export interface ForgetInput {
   sessionId?: SessionId
   cwd?: string
+  scope?: 'global' | 'workspace'
   id: string
 }
 
@@ -1711,13 +1712,22 @@ export class WorkspaceMemoryEngine {
   }
 
   async update(input: UpdateInput): Promise<{ scope: string; updated: boolean }> {
-    const scope = this.store.scope(input.cwd)
+    const scope = input.scope === 'global' ? this.store.scope('') : this.store.scope(input.cwd)
     return this.store.withScope(scope, async () => {
       await this.store.ensure(scope)
       const entries = await this.store.readEntries(scope)
       const entry = entries.find(candidate => candidate.id === input.id && isRecallable(candidate))
       if (entry === undefined) return { scope: scope.key, updated: false }
-      const proposal = normalizeProposal(input)
+      const proposal = normalizeProposal({
+        content: input.content,
+        scope: input.scope ?? entry.scope ?? (scope.key === 'global' ? 'global' : 'workspace'),
+        type: input.type ?? entry.type,
+        title: input.title ?? entry.title,
+        description: input.description ?? entry.description,
+        retrievalTerms: input.retrievalTerms ?? entry.retrievalTerms,
+        tags: input.tags ?? entry.tags,
+        importance: input.importance ?? entry.importance,
+      })
       if (proposal === undefined) throw new Error('memory content is empty or contains a credential-like secret')
       const next = {
         content: proposal.content,
@@ -1751,7 +1761,7 @@ export class WorkspaceMemoryEngine {
   }
 
   async forget(input: ForgetInput): Promise<{ scope: string; deleted: boolean }> {
-    const scope = this.store.scope(input.cwd)
+    const scope = input.scope === 'global' ? this.store.scope('') : this.store.scope(input.cwd)
     return this.store.withScope(scope, async () => {
       await this.store.ensure(scope)
       const entries = await this.store.readEntries(scope)

@@ -78,6 +78,20 @@ const DEFAULTS = Object.freeze({
 })
 
 const FRESHNESS_WAIT_MS = 10_000
+const MEMORY_SCOPE_POLICY = 'Use global for stable cross-project user identity and profile facts (for example name, age, birthday, residence), long-term preferences, and general working methods. Use workspace only for facts, decisions, architecture, rules, and fixes that apply to the current project.'
+const GLOBAL_PROFILE_TAGS = new Set([
+  '用户信息', '用户画像', '个人信息', '姓名', '年龄', '生日', '出生日期', '居住地', '住址', '常住地',
+  'profile', 'userprofile', 'identity', 'residence', 'address',
+])
+
+function normalizeMemoryTag(value: string): string {
+  return value.trim().toLocaleLowerCase('en-US').replace(/[\s_-]+/gu, '')
+}
+
+function effectiveRememberScope(input: RememberInput): 'global' | 'workspace' {
+  if (input.scope === 'global') return 'global'
+  return input.tags?.some(tag => GLOBAL_PROFILE_TAGS.has(normalizeMemoryTag(tag))) === true ? 'global' : 'workspace'
+}
 
 export interface Config {
   memoryDir?: string
@@ -314,7 +328,7 @@ function memoryReference(context: MemoryReferenceContext, includeSummary = true)
   if (context.matches.length > 0) {
     sections.push('与当前问题相关的长期记忆：\n' + context.matches.map(item => {
       const conflict = item.status === 'conflict' ? ` [存在冲突${(item.conflictWith ?? []).length > 0 ? `：${item.conflictWith?.join(', ')}` : ''}]` : ''
-      return `- [${item.id}] [${item.type ?? 'fact'}]${conflict} ${item.title}\n  ${item.description}\n  ${item.content}`
+      return `- [${item.scope}:${item.id}] [${item.type ?? 'fact'}]${conflict} ${item.title}\n  ${item.description}\n  ${item.content}`
     }).join('\n'))
   }
   if (sections.length === 0) return ''
@@ -518,28 +532,45 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
   async remember(input: RememberInput): ReturnType<WorkspaceMemoryEngine['remember']> {
     const cwd = await this.resolveCwd(input)
     await this.syncOrphanedScopes()
-    if (cwd !== '' && await this.isArchivedCwd(cwd)) return { scope: this.store.scope(cwd).key, added: 0, updated: 0, ignored: 1 }
-    const result = await this.engine.remember({ ...input, cwd })
-    if (result.added + result.updated > 0) this.scheduleSemanticSummary(input.scope === 'global' ? this.store.scope('') : this.store.scope(cwd))
+    const scope = effectiveRememberScope(input)
+    if (scope === 'workspace' && cwd !== '' && await this.isArchivedCwd(cwd)) return { scope: this.store.scope(cwd).key, added: 0, updated: 0, ignored: 1 }
+    const result = await this.engine.remember({ ...input, cwd, scope })
+    if (result.added + result.updated > 0) this.scheduleSemanticSummary(scope === 'global' ? this.store.scope('') : this.store.scope(cwd))
     return result
   }
 
   async forget(input: ForgetInput): ReturnType<WorkspaceMemoryEngine['forget']> {
     const cwd = await this.resolveCwd(input)
     await this.syncOrphanedScopes()
-    if (cwd !== '' && await this.isArchivedCwd(cwd)) return { scope: this.store.scope(cwd).key, deleted: false }
-    const result = await this.engine.forget({ ...input, cwd })
-    if (result.deleted) this.scheduleSemanticSummary(this.store.scope(cwd))
+    const scope = await this.locateMemoryScope(cwd, input.id)
+    if (scope === undefined) return { scope: input.scope === 'global' ? 'global' : this.store.scope(cwd).key, deleted: false }
+    if (scope === 'workspace' && cwd !== '' && await this.isArchivedCwd(cwd)) return { scope: this.store.scope(cwd).key, deleted: false }
+    const result = await this.engine.forget({ ...input, cwd, scope })
+    if (result.deleted) this.scheduleSemanticSummary(scope === 'global' ? this.store.scope('') : this.store.scope(cwd))
     return result
   }
 
   async updateMemory(input: UpdateInput): ReturnType<WorkspaceMemoryEngine['update']> {
     const cwd = await this.resolveCwd(input)
     await this.syncOrphanedScopes()
-    if (cwd !== '' && await this.isArchivedCwd(cwd)) return { scope: this.store.scope(cwd).key, updated: false }
-    const result = await this.engine.update({ ...input, cwd })
-    if (result.updated) this.scheduleSemanticSummary(this.store.scope(cwd))
+    const scope = await this.locateMemoryScope(cwd, input.id)
+    if (scope === undefined) return { scope: input.scope === 'global' ? 'global' : this.store.scope(cwd).key, updated: false }
+    if (scope === 'workspace' && cwd !== '' && await this.isArchivedCwd(cwd)) return { scope: this.store.scope(cwd).key, updated: false }
+    const result = await this.engine.update({ ...input, cwd, scope })
+    if (result.updated) this.scheduleSemanticSummary(scope === 'global' ? this.store.scope('') : this.store.scope(cwd))
     return result
+  }
+
+  private async locateMemoryScope(cwd: string, id: string): Promise<'global' | 'workspace' | undefined> {
+    const global = this.store.scope('')
+    const workspace = this.store.scope(cwd)
+    const candidates: Array<{ kind: 'global' | 'workspace'; scope: WorkspaceScope }> = [{ kind: 'global', scope: global }]
+    if (workspace.key !== global.key) candidates.push({ kind: 'workspace', scope: workspace })
+    const located = (await Promise.all(candidates.map(async candidate => ({
+      ...candidate,
+      found: (await this.store.readEntries(candidate.scope)).some(entry => entry.id === id && isRecallable(entry)),
+    })))).filter(candidate => candidate.found)
+    return located.length === 1 ? located[0]?.kind : undefined
   }
 
   private scheduleChangedSummaries(cwd: string, result: MutationResult): void {
@@ -956,7 +987,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
           '输出肯定、可判断且带适用条件的陈述；否定事实应同时说明原因或替代方案。忽略寒暄、临时任务、进度播报、未确认猜测、密钥和凭据。',
           '输出 version=1 的 operations。op 只能是 add/revise/supersede/flag-conflict。revise/supersede/flag-conflict 必须引用 existing_memories 中的 targetId 和 targetScope。',
           '只有用户消息明确纠正旧事实时才输出 supersede；必须提供 evidenceMessageIds、newQuote 和 oldQuote。newQuote 必须逐字来自对应用户消息，oldQuote 必须逐字来自 target.content。证据不足或只是助手自行发现时使用 flag-conflict。confidence 不能代替这些证据。',
-          '同义改写使用 revise；无关事实使用 add。scope/targetScope 只能是 global 或 workspace；全局只保存用户长期偏好和通用工作方式。type 只能是 preference/decision/architecture/rule/fact/fix。',
+          `同义改写使用 revise；无关事实使用 add。scope/targetScope 只能是 global 或 workspace。${MEMORY_SCOPE_POLICY} type 只能是 preference/decision/architecture/rule/fact/fix。`,
           '只输出一行 JSON：{"version":1,"operations":[{"op":"add","scope":"workspace","type":"fact","title":"...","description":"...","content":"...","tags":["project"],"retrievalTerms":["同义词"],"importance":1}]}。没有操作时输出 {"version":1,"operations":[]}。',
           ...(recoveryInstruction === undefined ? [] : ['', recoveryInstruction]),
           '',
@@ -1197,7 +1228,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
       const disposers: Array<() => void> = []
       disposers.push(tools.register(defineTool({
         name: 'memory_search',
-        description: 'Search durable memory for the current workspace using lightweight lexical retrieval.',
+        description: 'Search global and current-workspace durable memory. Search before adding or updating so an existing fact is revised instead of duplicated.',
         parameters: {
           query: { type: 'string', required: true, description: 'Keywords or a natural-language question.' },
           limit: { type: 'number', description: 'Maximum matches, default 8.' },
@@ -1236,9 +1267,13 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
       })))
       disposers.push(tools.register(defineTool({
         name: 'memory_remember',
-        description: 'Explicitly store one durable fact in the current workspace memory.',
+        description: `Store one new durable fact. ${MEMORY_SCOPE_POLICY} Search first and use memory_update when the fact already exists. Stable profile tags are always promoted to global even if scope is mistaken.`,
         parameters: {
+          scope: { type: 'string', required: true, enum: ['global', 'workspace'], description: MEMORY_SCOPE_POLICY },
           content: { type: 'string', required: true, description: 'One durable factual statement.' },
+          type: { type: 'string', enum: ['preference', 'decision', 'architecture', 'rule', 'fact', 'fix'], description: 'Structured memory type.' },
+          title: { type: 'string', description: 'Short title.' },
+          description: { type: 'string', description: 'Concise explanation.' },
           tags: { type: 'array', items: { type: 'string' }, description: 'Optional classification tags.' },
           importance: { type: 'number', description: 'Importance from 0 to 3.' },
         },
@@ -1250,15 +1285,53 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
         },
         execute: (args, exec) => this.remember({
           ...(exec.agent === undefined ? {} : { sessionId: exec.agent.session.id }),
+          scope: args.scope,
           content: args.content,
+          ...(args.type === undefined ? {} : { type: args.type }),
+          ...(args.title === undefined ? {} : { title: args.title }),
+          ...(args.description === undefined ? {} : { description: args.description }),
+          ...(args.tags === undefined ? {} : { tags: args.tags }),
+          ...(args.importance === undefined ? {} : { importance: args.importance }),
+        }),
+      })))
+      disposers.push(tools.register(defineTool({
+        name: 'memory_update',
+        description: `Revise an existing durable memory using the exact id and scope returned by memory_search. The id is authoritative and the runtime corrects a mistaken scope. ${MEMORY_SCOPE_POLICY}`,
+        parameters: {
+          id: { type: 'string', required: true, description: 'Existing memory id returned by memory_search.' },
+          scope: { type: 'string', required: true, enum: ['global', 'workspace'], description: 'Scope shown by memory_search. The runtime locates the exact id if this hint is mistaken.' },
+          content: { type: 'string', required: true, description: 'Corrected durable factual statement.' },
+          type: { type: 'string', enum: ['preference', 'decision', 'architecture', 'rule', 'fact', 'fix'], description: 'Structured memory type; omitted fields retain their existing values.' },
+          title: { type: 'string', description: 'Short title; omit to retain the existing title.' },
+          description: { type: 'string', description: 'Concise explanation; omit to retain the existing description.' },
+          tags: { type: 'array', items: { type: 'string' }, description: 'Classification tags; omit to retain existing tags.' },
+          importance: { type: 'number', description: 'Importance from 0 to 3; omit to retain the existing value.' },
+        },
+        output: {
+          schema: { type: 'object', additionalProperties: false, properties: {
+            scope: { type: 'string', required: true }, updated: { type: 'boolean', required: true },
+          } },
+          render: (_args, value) => outputText(value.updated ? `Memory updated in ${value.scope}.` : 'Memory id was not found in global or the current workspace.'),
+        },
+        execute: (args, exec) => this.updateMemory({
+          ...(exec.agent === undefined ? {} : { sessionId: exec.agent.session.id }),
+          id: args.id,
+          scope: args.scope,
+          content: args.content,
+          ...(args.type === undefined ? {} : { type: args.type }),
+          ...(args.title === undefined ? {} : { title: args.title }),
+          ...(args.description === undefined ? {} : { description: args.description }),
           ...(args.tags === undefined ? {} : { tags: args.tags }),
           ...(args.importance === undefined ? {} : { importance: args.importance }),
         }),
       })))
       disposers.push(tools.register(defineTool({
         name: 'memory_forget',
-        description: 'Delete one durable memory entry by id from the current workspace.',
-        parameters: { id: { type: 'string', required: true, description: 'Memory id returned by memory_search.' } },
+        description: 'Delete one durable memory entry using the exact id and scope returned by memory_search.',
+        parameters: {
+          id: { type: 'string', required: true, description: 'Memory id returned by memory_search.' },
+          scope: { type: 'string', required: true, enum: ['global', 'workspace'], description: 'Exact scope returned by memory_search.' },
+        },
         output: {
           schema: { type: 'object', additionalProperties: false, properties: {
             scope: { type: 'string', required: true }, deleted: { type: 'boolean', required: true },
@@ -1268,6 +1341,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
         execute: (args, exec) => this.forget({
           ...(exec.agent === undefined ? {} : { sessionId: exec.agent.session.id }),
           id: args.id,
+          scope: args.scope,
         }),
       })))
       ctx.effect(() => () => {

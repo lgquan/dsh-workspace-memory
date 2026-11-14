@@ -128,9 +128,14 @@ dsh plugin --profile web remove --config.minimumReleaseAge=0 @flowingspring/dsh-
 
 - 每个 Agent step 都会注入一份有大小上限的稳定摘要；
 - Agent 第一个 step 会根据当前问题检索相关结构化记忆；
-- Agent 还可以调用 `memory_search` 做第二次检索；
-- `memory_remember` 可以显式保存一条长期事实；
-- `memory_forget` 可以按记忆 ID 删除条目。
+- Agent 还可以调用 `memory_search` 搜索 global 和当前工作区的条目；
+- `memory_remember` 可以显式保存一条新事实，并且必须选择 `global` 或 `workspace`；
+- `memory_update` 可以使用搜索结果中的记忆 ID 和 scope 修订已有事实；
+- `memory_forget` 可以使用记忆 ID 和 scope 软删除条目。
+
+姓名、年龄、生日、居住地等稳定用户画像，以及跨项目长期偏好和通用工作方式保存到 global；只对当前项目成立的事实、决策、架构、规则和修复保存到 workspace。显式工具和后台整理共用这套作用域规则。
+
+搜索结果会将 scope 与记忆 ID 一起显示。更新和删除时 ID 是权威定位依据，即使模型误填 scope，插件也会在 global 与当前 workspace 中定位唯一 ID；新增事实若带有用户信息、用户画像、姓名、年龄、生日、居住地等稳定画像标签，则会被确定性提升到 global，避免依赖模型自行判断作用域。
 
 明确的用户纠正可以取代旧事实；证据不足的矛盾不会静默覆盖，而会保留为显式冲突。修订前的内容和被取代条目继续保留用于审计，但不会作为有效事实进入稳定摘要。
 

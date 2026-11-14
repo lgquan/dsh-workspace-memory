@@ -70,6 +70,16 @@ interface WorkspaceMemory {
 此外，运行时提供 `remember`、`update`、`forget` 和 `search` 能力供显式记忆工具与设置页使用。调用方
 不能直接操作 JSON 文件；这样可以统一处理去重、敏感信息过滤和并发写入。
 
+Agent 显式写入、更新和删除时必须携带 `global | workspace` scope。稳定用户身份与画像（姓名、年龄、
+生日、居住地）、跨项目长期偏好和通用工作方式属于 global；只对当前项目成立的事实、决策、架构、
+规则和修复属于 workspace。`memory_search` 返回条目的 ID 和 scope，已有事实必须通过
+`memory_update` 修订，不能在另一 scope 新建副本。
+
+记忆 ID 在 global 与当前 workspace 间作为权威定位依据；update/forget 不直接信任模型提供的 scope，只有
+恰好一个 scope 含该 active ID 时才执行，ID 冲突或不存在时失败关闭。remember 没有既有 ID 可定位，
+因此对用户信息、用户画像、姓名、年龄、生日、居住地等稳定画像标签执行确定性 global 提升。搜索
+展示使用 `[scope:id]`，让模型和审计日志都能看到真实作用域。
+
 ## 5. 数据流
 
 ### Agent

@@ -18,7 +18,7 @@ import LlmRuntime, {
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
-import { WorkspaceMemoryStore } from '../src/core.ts'
+import { WorkspaceMemoryStore, type MemoryContext } from '../src/core.ts'
 import WorkspaceMemoryRuntime from '../src/index.ts'
 
 class MemoryAdapter extends LlmAdapter {
@@ -294,6 +294,76 @@ test('Cordis adapter distils, stores, recalls, and registers explicit tools', as
   assert.ok(ctx.tools.get('memory_search'))
   assert.ok(ctx.tools.get('memory_remember'))
   assert.ok(ctx.tools.get('memory_forget'))
+})
+
+test('Agent tools revise a global user profile without creating a workspace duplicate', async () => {
+  const memoryDir = await mkdtemp(join(tmpdir(), 'dsh-workspace-memory-global-profile-tools-'))
+  const workspace = join(memoryDir, 'project')
+  const ctx = new Context()
+  onTestFinished(async () => {
+    await ctx.fiber.dispose()
+    await rm(memoryDir, { recursive: true, force: true })
+  })
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(LlmRuntime)
+  await ctx.plugin(SystemPrompt)
+  await ctx.plugin(WorkspaceMemoryRuntime, { memoryDir })
+  await ctx.plugin(ToolRuntime)
+  await flushAsyncWork()
+
+  const session = ctx.sessions.create(SessionId('global-profile-tool-test'), { meta: { cwd: workspace } })
+  const searchTool = ctx.tools.get('memory_search')
+  const rememberTool = ctx.tools.get('memory_remember')
+  const updateTool = ctx.tools.get('memory_update')
+  assert.ok(searchTool)
+  assert.ok(rememberTool)
+  assert.ok(updateTool)
+  const rememberSchema = ctx.tools.schemas().find(tool => tool.name === 'memory_remember')?.parameters as {
+    required?: string[]
+    properties?: { scope?: { enum?: string[] } }
+  }
+  assert.ok(rememberSchema.required?.includes('scope'))
+  assert.deepEqual(rememberSchema.properties?.scope?.enum, ['global', 'workspace'])
+
+  const agent = { session } as Agent
+  const remembered = await rememberTool.execute({
+    scope: 'workspace',
+    content: '用户现居上海市，尚未提供具体区。',
+    type: 'fact',
+    title: '用户居住地',
+    description: '用户现居上海市',
+    tags: ['用户信息', '居住地'],
+    importance: 2,
+  }, { agent } as never) as { scope: string; added: number }
+  assert.equal(remembered.scope, 'global')
+  assert.equal(remembered.added, 1)
+
+  const store = new WorkspaceMemoryStore(memoryDir)
+  const globalScope = store.scope('')
+  const original = (await store.readEntries(globalScope))[0]
+  assert.ok(original)
+  const searched = await searchTool.execute({ query: '用户居住地' }, { agent } as never) as MemoryContext
+  const renderedSearch = searchTool.output.render({ query: '用户居住地' }, searched as never)
+    .flatMap(block => block.type === 'text' ? [block.text] : [])
+    .join('\n')
+  assert.match(renderedSearch, new RegExp(`\\[global:${original.id}\\]`, 'u'))
+  const result = await updateTool.execute({
+    scope: 'workspace',
+    id: original.id,
+    content: '用户现居上海市青浦区。',
+  }, { agent } as never) as { scope: string; updated: boolean }
+
+  assert.deepEqual(result, { scope: 'global', updated: true })
+  const globalEntries = await store.readEntries(globalScope)
+  assert.equal(globalEntries.length, 1)
+  assert.equal(globalEntries[0]?.content, '用户现居上海市青浦区。')
+  assert.equal(globalEntries[0]?.title, '用户居住地')
+  assert.equal(globalEntries[0]?.description, '用户现居上海市')
+  assert.equal(globalEntries[0]?.type, 'fact')
+  assert.deepEqual(globalEntries[0]?.tags, ['用户信息', '居住地'])
+  assert.equal(globalEntries[0]?.importance, 2)
+  assert.equal(globalEntries[0]?.revisions?.[0]?.content, '用户现居上海市，尚未提供具体区。')
+  assert.deepEqual(await store.readEntries(store.scope(workspace)), [])
 })
 
 test('builds a validated semantic summary without requiring model JSON or copied source IDs', async () => {
