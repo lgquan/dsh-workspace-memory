@@ -1020,6 +1020,21 @@ test('browser API exposes Host workspace titles and the routable model catalog',
 
   const deleteResponse = await requestJson(entryHandler, entryUrl, 'DELETE')
   assert.equal(deleteResponse.status, 200)
+  const deletePayload = deleteResponse.body as {
+    summaryRefresh: { phase: string; nextRunAt?: string; topics: Array<{ id: string; title: string }> }
+  }
+  assert.equal(deletePayload.summaryRefresh.phase, 'scheduled')
+  assert.ok(Date.parse(deletePayload.summaryRefresh.nextRunAt ?? '') > Date.now())
+  assert.deepEqual(deletePayload.summaryRefresh.topics, [{ id: 'architecture', title: '架构' }])
+
+  const refreshingResponse = await requestJson(scopeHandler, `/workspace-memory/api/v1/scope?cwd=${encodeURIComponent(workspace)}`)
+  assert.equal(refreshingResponse.status, 200)
+  const refreshingPayload = refreshingResponse.body as {
+    state: { summaryRefresh: { phase: string; nextRunAt?: string; topics: Array<{ id: string; title: string }> } }
+  }
+  assert.equal(refreshingPayload.state.summaryRefresh.phase, 'scheduled')
+  assert.equal(refreshingPayload.state.summaryRefresh.nextRunAt, deletePayload.summaryRefresh.nextRunAt)
+  assert.deepEqual(refreshingPayload.state.summaryRefresh.topics, [{ id: 'architecture', title: '架构' }])
   const deletedSnapshot = await new WorkspaceMemoryStore(memoryDir).readSnapshot(scope)
   assert.equal(deletedSnapshot.entries[0]?.status, 'deleted')
   assert.doesNotMatch(deletedSnapshot.summary, /数据库选型/u)

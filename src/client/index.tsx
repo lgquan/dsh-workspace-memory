@@ -19,6 +19,13 @@ const zh = {
   search: '筛选记忆',
   searchPlaceholder: '搜索标题、内容或标签',
   noSummary: '暂无摘要',
+  summaryUpdating: '摘要正在更新',
+  summaryStartsIn: '预计约 {seconds} 秒后开始',
+  summaryRunning: '模型正在生成摘要',
+  summaryQueued: '正在等待可用的整理资源',
+  summaryModelDuration: '模型生成通常还需几十秒',
+  summaryTopics: '更新主题',
+  summaryRecallAvailable: '更新期间，结构化记忆仍可正常检索',
   noEntries: '暂无结构化记忆',
   loading: '正在读取…',
   failed: '读取记忆失败',
@@ -89,6 +96,13 @@ const en = {
   search: 'Filter memory',
   searchPlaceholder: 'Search title, content, or tags',
   noSummary: 'No summary yet',
+  summaryUpdating: 'Summary is updating',
+  summaryStartsIn: 'Expected to start in about {seconds} seconds',
+  summaryRunning: 'The model is generating the summary',
+  summaryQueued: 'Waiting for available distillation capacity',
+  summaryModelDuration: 'Model generation usually takes tens of seconds',
+  summaryTopics: 'Updating topics',
+  summaryRecallAvailable: 'Structured memories remain searchable during the update',
   noEntries: 'No structured memories yet',
   loading: 'Loading…',
   failed: 'Unable to read memory',
@@ -170,6 +184,13 @@ interface ProcessingInfo {
   lastError?: string
 }
 
+interface SummaryRefreshInfo {
+  phase: 'idle' | 'scheduled' | 'queued' | 'running'
+  nextRunAt?: string
+  runningSince?: string
+  topics: Array<{ id: string; title: string }>
+}
+
 interface DistillationStats {
   calls: number
   failures: number
@@ -214,7 +235,7 @@ interface ScopePayload {
   scope: { key: string; cwd: string; kind: 'global' | 'workspace' }
   summary: string
   entries: MemoryEntry[]
-  state: { pending: number; checkpointCount: number; lastCheckpointAt: number; processing: ProcessingInfo; distillation: DistillationStats }
+  state: { pending: number; checkpointCount: number; lastCheckpointAt: number; processing: ProcessingInfo; summaryRefresh: SummaryRefreshInfo; distillation: DistillationStats }
 }
 
 interface ModelSettings {
@@ -443,6 +464,11 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
   const unavailableSelection = modelSettings !== undefined && modelSettings.available === false
     ? modelSettings.selection
     : undefined
+  const summaryRefresh = view === 'active' ? displayedPayload?.state.summaryRefresh : undefined
+  const summaryRefreshActive = summaryRefresh !== undefined && summaryRefresh.phase !== 'idle' && summaryRefresh.topics.length > 0
+  const summaryWaitSeconds = summaryRefresh?.nextRunAt === undefined
+    ? undefined
+    : Math.max(1, Math.ceil((Date.parse(summaryRefresh.nextRunAt) - Date.now()) / 1000))
 
   const filteredEntries = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase()
@@ -681,6 +707,18 @@ function MemorySection({ t }: { t: Translate } & Partial<SettingsSectionOwnerPro
       view === 'archived' && displayedPayload !== undefined && h('button', { type: 'button', onClick: () => { void purge() }, style: { justifySelf: 'start', color: colors.danger, background: 'transparent', border: `1px solid ${colors.danger}`, borderRadius: 8, padding: '7px 11px', cursor: 'pointer' } }, t('purge')),
       h('article', { style: { border: `1px solid ${colors.border}`, borderRadius: 6, padding: 14, background: colors.surface } },
         h('h3', { style: { margin: '0 0 10px', fontSize: 14 } }, t('summary')),
+        summaryRefreshActive && h('div', { role: 'status', style: { display: 'grid', gap: 5, marginBottom: 12, padding: '9px 10px', borderLeft: `3px solid ${colors.accent}`, background: colors.elevated, color: colors.secondary, fontSize: 12, lineHeight: 1.5 } },
+          h('strong', { style: { color: colors.text, fontSize: 13 } }, t('summaryUpdating')),
+          h('span', null,
+            summaryRefresh.phase === 'scheduled' && summaryWaitSeconds !== undefined
+              ? `${t('summaryStartsIn').replace('{seconds}', String(summaryWaitSeconds))}；${t('summaryModelDuration')}`
+              : summaryRefresh.phase === 'running'
+                ? `${t('summaryRunning')}；${t('summaryModelDuration')}`
+                : `${t('summaryQueued')}；${t('summaryModelDuration')}`,
+          ),
+          h('span', null, `${t('summaryTopics')}：${summaryRefresh.topics.map(topic => topic.title).join('、')}`),
+          h('span', null, t('summaryRecallAvailable')),
+        ),
         h('pre', { style: { margin: 0, color: colors.secondary, whiteSpace: 'pre-wrap', wordBreak: 'break-word', font: 'inherit', lineHeight: 1.55 } }, displayedPayload?.summary.trim() || t('noSummary')),
       ),
       h('div', { style: { display: 'grid', gap: 10 } },

@@ -28,3 +28,11 @@ test('memory settings show daily and cumulative tokens only for workspace scopes
   assert.match(clientSource, /state\.processing\.phase === 'blocked'/u)
   assert.match(clientSource, /workspace-memory\/api\/v1\/retry/u)
 })
+
+test('summary area explains queued semantic refreshes and their expected wait', () => {
+  assert.match(clientSource, /summaryUpdating:\s*'摘要正在更新'/u)
+  assert.match(clientSource, /summaryStartsIn:\s*'预计约 \{seconds\} 秒后开始'/u)
+  assert.match(clientSource, /summaryModelDuration:\s*'模型生成通常还需几十秒'/u)
+  assert.match(clientSource, /state\.summaryRefresh/u)
+  assert.match(clientSource, /summaryRefresh\.topics/u)
+})

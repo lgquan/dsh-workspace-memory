@@ -452,7 +452,8 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
 
   private readonly settings: ResolvedConfig
   private readonly idleTimers = new Map<string, NodeJS.Timeout>()
-  private readonly summaryTimers = new Map<string, NodeJS.Timeout>()
+  private readonly summaryTimers = new Map<string, { timer: NodeJS.Timeout; dueAt: number }>()
+  private readonly summaryRunningSince = new Map<string, number>()
   private readonly processing = new Map<string, ScopeProcessingStatus>()
   private readonly checkpointQueue: QueuedCheckpoint[] = []
   private readonly scopeDistillations = new Map<string, Set<Promise<CheckpointResult>>>()
@@ -490,8 +491,9 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
     ctx.effect(() => () => {
       for (const timer of this.idleTimers.values()) clearTimeout(timer)
       this.idleTimers.clear()
-      for (const timer of this.summaryTimers.values()) clearTimeout(timer)
+      for (const scheduled of this.summaryTimers.values()) clearTimeout(scheduled.timer)
       this.summaryTimers.clear()
+      this.summaryRunningSince.clear()
       this.processing.clear()
       this.surfacedBySession.clear()
       this.closed = true
@@ -799,13 +801,15 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
   private scheduleSemanticSummary(scope: WorkspaceScope, delayMs = this.settings.semanticSummaryDelayMs): void {
     if (this.closed) return
     const previous = this.summaryTimers.get(scope.key)
-    if (previous !== undefined) clearTimeout(previous)
+    if (previous !== undefined) clearTimeout(previous.timer)
+    const boundedDelay = Math.max(10, delayMs)
     const timer = setTimeout(() => {
+      if (this.summaryTimers.get(scope.key)?.timer !== timer) return
       this.summaryTimers.delete(scope.key)
       void this.refreshSemanticSummary(scope)
-    }, Math.max(10, delayMs))
+    }, boundedDelay)
     timer.unref?.()
-    this.summaryTimers.set(scope.key, timer)
+    this.summaryTimers.set(scope.key, { timer, dueAt: Date.now() + boundedDelay })
   }
 
   private async refreshSemanticSummary(scope: WorkspaceScope): Promise<void> {
@@ -815,6 +819,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
       return
     }
     this.activeDistillations += 1
+    this.summaryRunningSince.set(scope.key, Date.now())
     try {
       const preparation = await this.store.prepareSemanticSummary(
         scope,
@@ -841,9 +846,25 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
       this.ctx.logger.warn('workspace-memory semantic summary failed for scope=%s: %o', scope.key, error)
       this.scheduleSemanticSummary(scope, Math.max(60_000, this.settings.semanticSummaryDelayMs))
     } finally {
+      this.summaryRunningSince.delete(scope.key)
       this.activeDistillations -= 1
       this.drainCheckpointQueue()
     }
+  }
+
+  private async summaryRefreshView(scope: WorkspaceScope): Promise<Record<string, unknown>> {
+    const preparation = await this.store.prepareSemanticSummary(scope, this.settings.semanticSummaryIntervalMs)
+    if (preparation.status === 'clean') return { phase: 'idle', topics: [] }
+    const topics = preparation.dirtyTopics.map(topic => ({ id: topic.id, title: topic.title }))
+    const runningSince = this.summaryRunningSince.get(scope.key)
+    if (runningSince !== undefined) {
+      return { phase: 'running', runningSince: new Date(runningSince).toISOString(), topics }
+    }
+    const scheduled = this.summaryTimers.get(scope.key)
+    if (scheduled !== undefined) {
+      return { phase: 'scheduled', nextRunAt: new Date(scheduled.dueAt).toISOString(), topics }
+    }
+    return { phase: 'queued', topics }
   }
 
   private async runSemanticSummaryCall(scope: WorkspaceScope, topics: readonly TopicSource[]): Promise<GeneratedTopic[]> {
@@ -1498,6 +1519,7 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
                 lastCheckpointAt: snapshot.state.lastCheckpointAt,
                 distillation: snapshot.state.distillation,
                 processing: this.processingView(snapshot.scope.key, snapshot.state),
+                summaryRefresh: await this.summaryRefreshView(snapshot.scope),
               },
             })
           } catch (error) {
@@ -1602,7 +1624,9 @@ export class WorkspaceMemoryRuntime extends Service implements WorkspaceMemory {
             }
             if (request.method === 'DELETE') {
               const result = await this.forget({ cwd, id })
-              sendJson(response, result.deleted ? 200 : 404, result)
+              const changedScope = result.scope === 'global' ? this.store.scope('') : this.store.scope(cwd)
+              const summaryRefresh = result.deleted ? await this.summaryRefreshView(changedScope) : { phase: 'idle', topics: [] }
+              sendJson(response, result.deleted ? 200 : 404, { ...result, summaryRefresh })
               return
             }
             if (request.method !== 'PUT') {
